@@ -1,7 +1,10 @@
-export default function CounselorGroupPage({
+import CounselorPage from "@/components/counselor/CounselorPage";
+
+export default async function CounselorGroupPage({
   params,
 }: {
   params: Promise<{ group: string }>;
 }) {
-  return <div />;
+  const { group } = await params;
+  return <CounselorPage group={group.toUpperCase()} />;
 }
