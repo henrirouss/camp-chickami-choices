@@ -6,9 +6,9 @@ export default function LeadershipLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="min-h-screen flex flex-col">
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <LeadershipNav />
-      <main className="flex-1">{children}</main>
+      <main style={{ flex: 1, display: "flex", overflow: "hidden" }}>{children}</main>
     </div>
   );
 }
