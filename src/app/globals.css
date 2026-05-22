@@ -13,3 +13,17 @@
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.3; }
 }
+
+@media print {
+  .no-print  { display: none !important; }
+  .print-break { break-after: page; }
+  .print-sheet {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+  }
+  @page { margin: 0.5in; size: letter portrait; }
+}

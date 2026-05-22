@@ -1,3 +1,5 @@
-export default function PrintPage() {
-  return <div />;
+import PrintPage from "@/components/print/PrintPage";
+
+export default function Print() {
+  return <PrintPage />;
 }
