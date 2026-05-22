@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createClient } from "@/lib/supabase/client";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -15,85 +16,43 @@ const C = {
 };
 const font = "var(--font-figtree), Figtree, sans-serif";
 
-// ── Static reference data ─────────────────────────────────────────────────────
-
-const ACTIVITY_DEFS = [
-  { name: "Field",         abbreviation: "F" },
-  { name: "Pool",          abbreviation: "Pool" },
-  { name: "Arts & Crafts", abbreviation: "A/C" },
-  { name: "Pav",           abbreviation: "Pav" },
-  { name: "Gaga",          abbreviation: "Gaga" },
-  { name: "Front Lawn",    abbreviation: "FL" },
-  { name: "Building",      abbreviation: "B" },
-  { name: "Courts",        abbreviation: "C" },
-  { name: "Chowderhouse",  abbreviation: "CH" },
-  { name: "Nature",        abbreviation: "N" },
-  { name: "Archery",       abbreviation: "Arch" },
-  { name: "Ropes",         abbreviation: "R" },
-  { name: "Loch Lodge",    abbreviation: "LL" },
-  { name: "New Games",     abbreviation: "NG" },
-];
-
-const GROUP_NAMES  = ["A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P"];
-const COUNSELORS   = ["Sarah K.","Mike T.","Priya L.","James R.","Lily C.","Omar S.","Grace W.","Ethan M.","Ava P.","Noah D.","Chloe B.","Liam F.","Zoe H.","Tyler N.","Maya G.","Connor J."];
-const SAMPLE_NAMES = [
-  ["Emma","Anderson"],["Liam","Barnes"],["Sofia","Campbell"],["Marcus","Chen"],["Lily","Davis"],
-  ["Deon","Edwards"],["Priya","Foster"],["Carlos","Garcia"],["Mia","Harris"],["Noah","Jackson"],
-  ["Aisha","Johnson"],["Tyler","Kim"],["Zoe","Lewis"],["Ethan","Martin"],["Chloe","Mitchell"],
-  ["Mason","Moore"],["Isabella","Nelson"],["Lucas","Nguyen"],["Harper","Okafor"],["Oliver","Parker"],
-  ["Ella","Patel"],["James","Perez"],["Scarlett","Quinn"],["Benjamin","Ramirez"],["Grace","Rivera"],
-  ["Elijah","Robinson"],["Stella","Rodriguez"],["Alexander","Scott"],["Hazel","Smith"],["Michael","Taylor"],
-  ["Aurora","Thomas"],["Daniel","Thompson"],["Luna","Torres"],["Henry","Turner"],["Savannah","Walker"],
-  ["Jackson","White"],["Nora","Williams"],["Sebastian","Wilson"],["Aria","Wright"],["Caleb","Young"],
-  ["Penelope","Adams"],["Owen","Baker"],["Hannah","Brooks"],["Wyatt","Butler"],["Layla","Carter"],
-  ["Julian","Clark"],["Violet","Collins"],["Grayson","Cooper"],["Riley","Cox"],["Levi","Cruz"],
-  ["Zoey","Diaz"],["Josiah","Evans"],["Naomi","Fleming"],["Evan","Gonzalez"],["Leah","Green"],
-  ["Connor","Hall"],["Audrey","Hayes"],["Dominic","Hill"],["Claire","Howard"],["Hunter","Hughes"],
-  ["Paisley","James"],["Lincoln","Jenkins"],["Savannah","King"],["Nolan","Lee"],["Addison","Long"],
-  ["Eli","Lopez"],["Brooklyn","Marshall"],["Jaxon","Mason"],["Skylar","Morgan"],["Miles","Murphy"],
-  ["Genesis","Murray"],["Easton","Myers"],["Mackenzie","Nelson"],["Bentley","Ortiz"],["Kennedy","Owens"],
-  ["Ryker","Palmer"],["Piper","Price"],["Brayden","Reed"],["Kinsley","Ross"],["Declan","Sanchez"],
-];
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Choices = [string, string, string];
+type Choices  = [string, string, string];
 type Camper   = { id: string; firstName: string; lastName: string; choices: Choices; absent: boolean };
-type Group    = { name: string; counselor: string; submitted: boolean; campers: Camper[] };
-type Activity = { name: string; abbreviation: string; open: [boolean, boolean, boolean] };
+type Group    = { id: string; name: string; counselor: string; submitted: boolean; campers: Camper[] };
+type Activity = { id: string; name: string; abbreviation: string; open: [boolean, boolean, boolean] };
 type Tab      = "grid" | "activities" | "roster" | "upload";
 
-// ── Seed helpers ──────────────────────────────────────────────────────────────
+// ── DB row types ──────────────────────────────────────────────────────────────
 
-function pick(seed: number) { return ACTIVITY_DEFS[((seed % 14) + 14) % 14].name; }
+type DBGroup    = { id: string; name: string; counselor_name: string | null; submitted: boolean };
+type DBCamper   = { id: string; first_name: string; last_name: string; group_id: string; absent: boolean; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null };
+type DBActivity = { id: string; name: string; abbreviation: string; open_p1: boolean; open_p2: boolean; open_p3: boolean };
 
-function makeChoices(gi: number, ci: number): Choices {
-  const s = gi * 17 + ci * 7;
-  return [pick(s), pick(s + 5), pick(s + 11)];
+// ── Converters ────────────────────────────────────────────────────────────────
+
+function toUiCamper(c: DBCamper): Camper {
+  return {
+    id: c.id,
+    firstName: c.first_name,
+    lastName:  c.last_name,
+    absent:    c.absent,
+    choices:   [c.choice_p1 ?? "", c.choice_p2 ?? "", c.choice_p3 ?? ""],
+  };
 }
 
-// ── Initial state ─────────────────────────────────────────────────────────────
+function buildGroups(dbGroups: DBGroup[], dbCampers: DBCamper[]): Group[] {
+  return dbGroups.map(g => ({
+    id:        g.id,
+    name:      g.name,
+    counselor: g.counselor_name ?? "",
+    submitted: g.submitted,
+    campers:   dbCampers.filter(c => c.group_id === g.id).map(toUiCamper),
+  }));
+}
 
-const INITIAL_GROUPS: Group[] = GROUP_NAMES.map((name, gi) => ({
-  name,
-  counselor: COUNSELORS[gi],
-  submitted: gi < 5,
-  campers: SAMPLE_NAMES.slice(gi * 5, gi * 5 + 5).map(([fn, ln], ci) => ({
-    id: `${name}-${ci}`,
-    firstName: fn,
-    lastName: ln,
-    absent: false,
-    choices: (gi < 5)          ? makeChoices(gi, ci)
-           : (gi < 8 && ci < 2) ? [pick(gi * 3 + ci), "", ""]
-           : ["", "", ""],
-  })),
-}));
-
-const INITIAL_ACTIVITIES: Activity[] = ACTIVITY_DEFS.map(a => ({
-  ...a, open: [true, true, true],
-}));
-
-// ── Small components ──────────────────────────────────────────────────────────
+// ── Toggle sub-component ──────────────────────────────────────────────────────
 
 function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   return (
@@ -106,22 +65,59 @@ function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function LeadershipDashboard() {
-  const [groups, setGroups]         = useState<Group[]>(INITIAL_GROUPS);
-  const [activities, setActivities] = useState<Activity[]>(INITIAL_ACTIVITIES);
-  const [tab, setTab]               = useState<Tab>("grid");
+  const supabase = useMemo(() => createClient(), []);
+
+  const [groups,     setGroups]     = useState<Group[]>([]);
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [loading,    setLoading]    = useState(true);
+  const [tab,        setTab]        = useState<Tab>("grid");
   const [movingCamper, setMovingCamper] = useState<{ gi: number; ci: number } | null>(null);
   const [moveTarget, setMoveTarget] = useState(0);
   const [alertDismissed, setAlertDismissed] = useState(false);
   const [schedFileName, setSchedFileName]   = useState<string | null>(null);
-  const [lastRefresh, setLastRefresh] = useState(new Date());
-  const csvRef  = useRef<HTMLInputElement>(null);
+  const settingsId = useRef<string | null>(null);
+  const csvRef   = useRef<HTMLInputElement>(null);
   const schedRef = useRef<HTMLInputElement>(null);
 
-  // ── Auto-refresh every 30 s ───────────────────────────────────────────────
+  // ── Load all data ─────────────────────────────────────────────────────────
+  const loadData = useCallback(async () => {
+    const [gRes, cRes, aRes, sRes] = await Promise.all([
+      supabase.from("groups").select("id, name, counselor_name, submitted").order("name"),
+      supabase.from("campers").select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3"),
+      supabase.from("activities").select("id, name, abbreviation, open_p1, open_p2, open_p3").order("name"),
+      supabase.from("settings").select("id").limit(1).maybeSingle(),
+    ]);
+
+    if (gRes.data && cRes.data) {
+      setGroups(buildGroups(gRes.data as DBGroup[], cRes.data as DBCamper[]));
+    }
+    if (aRes.data) {
+      setActivities((aRes.data as DBActivity[]).map(a => ({
+        id: a.id, name: a.name, abbreviation: a.abbreviation,
+        open: [a.open_p1, a.open_p2, a.open_p3],
+      })));
+    }
+    if (sRes.data) {
+      settingsId.current = (sRes.data as { id: string }).id;
+    }
+    setLoading(false);
+  }, [supabase]);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // ── Auto-refresh groups + campers every 30 s (sidebar status) ─────────────
   useEffect(() => {
-    const t = setInterval(() => setLastRefresh(new Date()), 30_000);
+    const t = setInterval(async () => {
+      const [gRes, cRes] = await Promise.all([
+        supabase.from("groups").select("id, name, counselor_name, submitted").order("name"),
+        supabase.from("campers").select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3"),
+      ]);
+      if (gRes.data && cRes.data) {
+        setGroups(buildGroups(gRes.data as DBGroup[], cRes.data as DBCamper[]));
+      }
+    }, 30_000);
     return () => clearInterval(t);
-  }, []);
+  }, [supabase]);
 
   // ── Conflict helpers ──────────────────────────────────────────────────────
   const getConflicts = useCallback(() => {
@@ -155,63 +151,126 @@ export default function LeadershipDashboard() {
   const pendCount = groups.length - doneCount;
 
   // ── Activity manager ──────────────────────────────────────────────────────
-  function toggleActivity(ai: number, pi: number) {
+  async function toggleActivity(ai: number, pi: number) {
+    const act    = activities[ai];
+    const newVal = !act.open[pi];
     setActivities(prev => prev.map((a, i) => i !== ai ? a : {
-      ...a, open: a.open.map((v, j) => j === pi ? !v : v) as [boolean, boolean, boolean],
+      ...a, open: a.open.map((v, j) => j === pi ? newVal : v) as [boolean, boolean, boolean],
     }));
     setAlertDismissed(false);
+    const field = (["open_p1", "open_p2", "open_p3"] as const)[pi];
+    await supabase.from("activities").update({ [field]: newVal }).eq("id", act.id);
   }
 
-  function setAllPeriods(ai: number, val: boolean) {
+  async function setAllPeriods(ai: number, val: boolean) {
+    const act = activities[ai];
     setActivities(prev => prev.map((a, i) => i !== ai ? a : { ...a, open: [val, val, val] }));
     setAlertDismissed(false);
+    await supabase.from("activities").update({ open_p1: val, open_p2: val, open_p3: val }).eq("id", act.id);
   }
 
   // ── Roster manager ────────────────────────────────────────────────────────
-  function removeCamper(gi: number, ci: number) {
+  async function removeCamper(gi: number, ci: number) {
+    const camper = groups[gi].campers[ci];
     setGroups(prev => prev.map((g, i) => i !== gi ? g : {
       ...g, campers: g.campers.filter((_, j) => j !== ci),
     }));
+    await supabase.from("campers").delete().eq("id", camper.id);
   }
 
-  function addCamper(gi: number, value: string, inputEl: HTMLInputElement) {
+  async function addCamper(gi: number, value: string, inputEl: HTMLInputElement) {
     const val = value.trim();
     if (!val) return;
     const [fn, ...rest] = val.split(" ");
-    setGroups(prev => prev.map((g, i) => i !== gi ? g : {
-      ...g, campers: [...g.campers, { id: `${g.name}-${Date.now()}`, firstName: fn, lastName: rest.join(" ") || "—", choices: ["", "", ""], absent: false }],
-    }));
-    inputEl.value = "";
+    const ln    = rest.join(" ");
+    const group = groups[gi];
+    const { data } = await supabase
+      .from("campers")
+      .insert({ first_name: fn, last_name: ln, group_id: group.id, absent: false })
+      .select("id")
+      .single();
+    if (data) {
+      setGroups(prev => prev.map((g, i) => i !== gi ? g : {
+        ...g, campers: [...g.campers, {
+          id: (data as { id: string }).id,
+          firstName: fn, lastName: ln,
+          choices: ["", "", ""], absent: false,
+        }],
+      }));
+      inputEl.value = "";
+    }
   }
 
-  function confirmMove() {
+  async function confirmMove() {
     if (!movingCamper) return;
-    const { gi, ci } = movingCamper;
+    const { gi, ci }   = movingCamper;
+    const camper        = groups[gi].campers[ci];
+    const targetGroupId = groups[moveTarget].id;
     setGroups(prev => {
       const next = prev.map(g => ({ ...g, campers: [...g.campers] }));
-      const [camper] = next[gi].campers.splice(ci, 1);
-      next[moveTarget].campers.push(camper);
+      const [c]  = next[gi].campers.splice(ci, 1);
+      next[moveTarget].campers.push(c);
       return next;
     });
     setMovingCamper(null);
+    await supabase.from("campers").update({ group_id: targetGroupId }).eq("id", camper.id);
   }
 
-  // ── CSV parse ─────────────────────────────────────────────────────────────
-  function parseCsv(text: string) {
+  // ── CSV parse + roster replace ────────────────────────────────────────────
+  async function parseCsv(text: string) {
     const lines = text.trim().split("\n").filter(l => l.trim());
     const hdr   = lines[0].toLowerCase();
     if (!hdr.includes("first") || !hdr.includes("group")) {
       alert("CSV format not recognized. Expected columns: first_name, last_name, group");
       return;
     }
-    const newGroups = INITIAL_GROUPS.map(g => ({ ...g, campers: [] as Camper[] }));
-    lines.slice(1).forEach(line => {
+    const rows = lines.slice(1).map(line => {
       const [fn, ln, grp] = line.split(",").map(s => s.trim());
-      const gi = GROUP_NAMES.indexOf(grp?.toUpperCase());
-      if (gi === -1 || !fn) return;
-      newGroups[gi].campers.push({ id: `${grp}-${Date.now()}-${Math.random()}`, firstName: fn, lastName: ln ?? "—", choices: ["", "", ""], absent: false });
-    });
-    setGroups(newGroups);
+      return { fn, ln: ln ?? "", grp: (grp ?? "").toUpperCase() };
+    }).filter(r => r.fn && r.grp);
+
+    // Build name → id map from current groups state
+    const groupMap = new Map(groups.map(g => [g.name, g.id]));
+
+    // Insert any groups from CSV that don't exist yet
+    const missingNames = [...new Set(rows.map(r => r.grp))].filter(n => !groupMap.has(n));
+    if (missingNames.length > 0) {
+      const { data: newGroups } = await supabase
+        .from("groups")
+        .insert(missingNames.map(name => ({ name })))
+        .select("id, name");
+      (newGroups as { id: string; name: string }[] | null)
+        ?.forEach(g => groupMap.set(g.name, g.id));
+    }
+
+    // Delete all current campers then insert fresh roster
+    if (groupMap.size > 0) {
+      await supabase.from("campers").delete().in("group_id", [...groupMap.values()]);
+    }
+    const toInsert = rows
+      .filter(r => groupMap.has(r.grp))
+      .map(r => ({ first_name: r.fn, last_name: r.ln, group_id: groupMap.get(r.grp)!, absent: false }));
+    if (toInsert.length > 0) {
+      await supabase.from("campers").insert(toInsert);
+    }
+    await loadData();
+  }
+
+  // ── Schedule photo upload ─────────────────────────────────────────────────
+  async function uploadSchedule(file: File) {
+    const ext  = file.name.split(".").pop() ?? "jpg";
+    const path = `schedule.${ext}`;
+    const { data, error } = await supabase.storage
+      .from("schedules")
+      .upload(path, file, { upsert: true });
+    if (error) { alert("Upload failed: " + error.message); return; }
+    const { data: { publicUrl } } = supabase.storage.from("schedules").getPublicUrl(data.path);
+    if (settingsId.current) {
+      await supabase.from("settings")
+        .update({ schedule_image_url: publicUrl })
+        .eq("id", settingsId.current);
+    }
+    setSchedFileName(file.name);
   }
 
   // ── Print summary ─────────────────────────────────────────────────────────
@@ -235,7 +294,7 @@ export default function LeadershipDashboard() {
 
   // ── Sidebar dot ───────────────────────────────────────────────────────────
   function dotStyle(status: "done" | "partial" | "pending"): React.CSSProperties {
-    const bg    = status === "done" ? "#4ADE80" : status === "partial" ? "#FCD34D" : "rgba(255,255,255,0.2)";
+    const bg     = status === "done" ? "#4ADE80" : status === "partial" ? "#FCD34D" : "rgba(255,255,255,0.2)";
     const shadow = status === "done" ? "0 0 6px rgba(74,222,128,0.4)" : "none";
     return { width: 8, height: 8, borderRadius: "50%", background: bg, boxShadow: shadow, flexShrink: 0 };
   }
@@ -243,6 +302,15 @@ export default function LeadershipDashboard() {
   const moveCamperName = movingCamper
     ? `${groups[movingCamper.gi]?.campers[movingCamper.ci]?.firstName ?? ""} ${groups[movingCamper.gi]?.campers[movingCamper.ci]?.lastName ?? ""}`.trim()
     : "";
+
+  // ── Loading screen ────────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: font, color: C.muted, fontSize: 14, fontWeight: 600 }}>
+        Loading…
+      </div>
+    );
+  }
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -282,15 +350,17 @@ export default function LeadershipDashboard() {
 
           <div style={{ flex: 1, overflowY: "auto", padding: "8px 0", scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.1) transparent" }}>
             {groups.map(g => {
-              const st = groupStatus(g);
+              const st      = groupStatus(g);
               const stColor = st === "done" ? "#4ADE80" : st === "partial" ? "#FCD34D" : "rgba(255,255,255,0.3)";
               const stLabel = st === "done" ? "Done" : st === "partial" ? "In progress" : "Pending";
               return (
-                <div key={g.name} onClick={() => setTab("grid")} style={{ display: "flex", alignItems: "center", padding: "8px 16px", gap: 10, cursor: "pointer" }}
+                <div key={g.id} onClick={() => setTab("grid")} style={{ display: "flex", alignItems: "center", padding: "8px 16px", gap: 10, cursor: "pointer" }}
                   onMouseEnter={e => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
                   onMouseLeave={e => (e.currentTarget.style.background = "transparent")}>
                   <div style={dotStyle(st)} />
-                  <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(255,255,255,0.8)", flex: 1 }}>Group {g.name} · {g.counselor.split(" ")[0]}</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(255,255,255,0.8)", flex: 1 }}>
+                    Group {g.name}{g.counselor ? ` · ${g.counselor.split(" ")[0]}` : ""}
+                  </div>
                   <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", color: stColor }}>{stLabel}</div>
                 </div>
               );
@@ -334,14 +404,14 @@ export default function LeadershipDashboard() {
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
                   {groups.map(g => {
                     const hasConflict = g.campers.some(c => c.choices.some((act, pi) => isConflict(act, pi)));
-                    const st = groupStatus(g);
-                    const cardBg     = g.submitted ? "#FAFFFA" : hasConflict ? C.yellowLt : C.white;
-                    const cardBorder = g.submitted ? C.sage    : hasConflict ? C.yellow   : C.border;
-                    const dotBg      = st === "done" ? C.green : st === "partial" ? C.yellow : C.border;
-                    const sorted     = [...g.campers].sort((a, b) => a.lastName.localeCompare(b.lastName));
-                    const MAX        = 4;
+                    const st          = groupStatus(g);
+                    const cardBg      = g.submitted ? "#FAFFFA" : hasConflict ? C.yellowLt : C.white;
+                    const cardBorder  = g.submitted ? C.sage    : hasConflict ? C.yellow   : C.border;
+                    const dotBg       = st === "done" ? C.green : st === "partial" ? C.yellow : C.border;
+                    const sorted      = [...g.campers].sort((a, b) => a.lastName.localeCompare(b.lastName));
+                    const MAX         = 4;
                     return (
-                      <div key={g.name} onClick={() => setTab("roster")} style={{ background: cardBg, border: `1.5px solid ${cardBorder}`, borderRadius: 12, padding: 12, cursor: "pointer", transition: "all 0.15s" }}
+                      <div key={g.id} onClick={() => setTab("roster")} style={{ background: cardBg, border: `1.5px solid ${cardBorder}`, borderRadius: 12, padding: 12, cursor: "pointer", transition: "all 0.15s" }}
                         onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.boxShadow = "0 2px 8px rgba(122,158,117,0.15)"; }}
                         onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.boxShadow = "none"; }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
@@ -369,6 +439,7 @@ export default function LeadershipDashboard() {
                           ))}
                         </div>
                         {sorted.length > MAX && <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, marginTop: 4, textAlign: "center" }}>+{sorted.length - MAX} more</div>}
+                        {sorted.length === 0 && <div style={{ fontSize: 11, color: C.muted, fontWeight: 500 }}>No campers yet</div>}
                       </div>
                     );
                   })}
@@ -393,7 +464,7 @@ export default function LeadershipDashboard() {
                     const actConflicts = conflicts.filter(c => c.act === act.name);
                     const allOpen      = act.open.every(v => v);
                     return (
-                      <div key={act.name} style={{ display: "grid", gridTemplateColumns: "1fr 100px 100px 100px 120px", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
+                      <div key={act.id} style={{ display: "grid", gridTemplateColumns: "1fr 100px 100px 100px 120px", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
                           {act.name}
                           {actConflicts.length > 0 && (
@@ -431,7 +502,7 @@ export default function LeadershipDashboard() {
                   {groups.map((g, gi) => {
                     const sorted = [...g.campers].sort((a, b) => a.lastName.localeCompare(b.lastName));
                     return (
-                      <div key={g.name} style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+                      <div key={g.id} style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
                         <div style={{ background: C.sageLt, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `1px solid ${C.border}` }}>
                           <span style={{ fontSize: 13, fontWeight: 800, color: C.sageDk }}>Group {g.name}</span>
                           <span style={{ fontSize: 11, fontWeight: 600, color: C.sage }}>{g.campers.length} campers</span>
@@ -539,7 +610,10 @@ export default function LeadershipDashboard() {
                       <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{schedFileName ? "Schedule uploaded · visible to all counselors" : "JPG, PNG, HEIC accepted"}</div>
                       <button onClick={e => { e.stopPropagation(); schedRef.current?.click(); }} style={{ display: "inline-block", marginTop: 10, background: C.sage, color: "white", border: "none", borderRadius: 8, padding: "7px 16px", fontFamily: font, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Choose Photo</button>
                     </div>
-                    <input ref={schedRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) setSchedFileName(f.name); }} />
+                    <input ref={schedRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (file) uploadSchedule(file);
+                    }} />
                   </div>
                 </div>
 
@@ -565,7 +639,7 @@ export default function LeadershipDashboard() {
             <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>Move to group</div>
             <select value={moveTarget} onChange={e => setMoveTarget(Number(e.target.value))} style={{ width: "100%", background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", fontFamily: font, fontSize: 13, fontWeight: 600, color: C.text, outline: "none", marginBottom: 16, cursor: "pointer" }}>
               {groups.map((g, i) => i !== movingCamper.gi && (
-                <option key={g.name} value={i}>Group {g.name} ({g.counselor})</option>
+                <option key={g.id} value={i}>Group {g.name}{g.counselor ? ` (${g.counselor})` : ""}</option>
               ))}
             </select>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
