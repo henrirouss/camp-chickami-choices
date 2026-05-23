@@ -31,6 +31,7 @@ type Settings = {
   sheets_url:         string | null;
   sort_order:         string | null;
   last_synced_at:     string | null;
+  google_email:       string | null;
 };
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -70,25 +71,74 @@ function Row({ label, sub, children }: { label: string; sub?: string; children: 
 export default function LeadershipSettings() {
   const supabase = useMemo(() => createClient(), []);
 
-  const [s,       setS]       = useState<Settings | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [confirm, setConfirm] = useState<"submissions" | "roster" | null>(null);
-  const [csvMsg,  setCsvMsg]  = useState<string | null>(null);
+  const [s,              setS]             = useState<Settings | null>(null);
+  const [loading,        setLoading]       = useState(true);
+  const [loadErr,        setLoadErr]       = useState<string | null>(null);
+  const [confirm,        setConfirm]       = useState<"submissions" | "roster" | null>(null);
+  const [csvMsg,         setCsvMsg]        = useState<string | null>(null);
+  const [syncing,        setSyncing]       = useState(false);
+  const [syncLog,        setSyncLog]       = useState<string[]>([]);
+  const [connectedBanner,setConnectedBanner] = useState(false);
 
   const schedRef = useRef<HTMLInputElement>(null);
   const csvRef   = useRef<HTMLInputElement>(null);
 
   // ── Load ──────────────────────────────────────────────────────────────────
   useEffect(() => {
-    supabase.from("settings").select("*").limit(1).maybeSingle()
-      .then(({ data }) => { if (data) setS(data as Settings); setLoading(false); });
+    supabase
+      .from("settings")
+      .select("id, schedule_image_url, sync_peak_start, sync_peak_end, sync_fast_interval, sync_slow_interval, auto_sync, two_col_cutoff, show_next_picks, show_sig_line, paper_size, sheets_url, sort_order, last_synced_at, google_email")
+      .limit(1)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (error) setLoadErr(error.message);
+        if (data) setS(data as Settings);
+        setLoading(false);
+      });
   }, [supabase]);
+
+  // ── Check for OAuth redirect ───────────────────────────────────────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (window.location.search.includes("connected=1")) {
+      setConnectedBanner(true);
+      window.history.replaceState({}, "", "/leadership/settings");
+      setTimeout(() => setConnectedBanner(false), 4000);
+    }
+  }, []);
 
   // ── Save helper ───────────────────────────────────────────────────────────
   function save(updates: Partial<Settings>) {
     if (!s) return;
     setS(prev => prev ? { ...prev, ...updates } : prev);
-    supabase.from("settings").update(updates as Record<string, unknown>).eq("id", s.id);
+    supabase.from("settings").update(updates as Record<string, unknown>).eq("id", s.id).then();
+  }
+
+  // ── Google Sheets helpers ─────────────────────────────────────────────────
+  async function syncNow() {
+    setSyncing(true);
+    const started = Date.now();
+    try {
+      const res  = await fetch("/api/google/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const data = await res.json() as { success?: boolean; rows?: number; syncedAt?: string; error?: string };
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      if (data.success) {
+        setSyncLog(prev => [`[${new Date().toLocaleString()}] ✓ Synced ${data.rows} campers (${secs}s)`, ...prev]);
+        setS(prev => prev ? { ...prev, last_synced_at: data.syncedAt ?? prev.last_synced_at } : prev);
+      } else {
+        setSyncLog(prev => [`[${new Date().toLocaleString()}] ✗ ${data.error ?? "Unknown error"}`, ...prev]);
+      }
+    } catch {
+      setSyncLog(prev => [`[${new Date().toLocaleString()}] ✗ Network error`, ...prev]);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function disconnectGoogle() {
+    await fetch("/api/google/disconnect", { method: "POST" });
+    setS(prev => prev ? { ...prev, google_email: null } : prev);
+    setSyncLog([]);
   }
 
   // ── Shared input/select styles ────────────────────────────────────────────
@@ -177,10 +227,19 @@ export default function LeadershipSettings() {
   }
 
   // ── Loading ───────────────────────────────────────────────────────────────
-  if (loading || !s) {
+  if (loading) {
     return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: font, color: C.muted, fontSize: 14, fontWeight: 600, background: C.bg }}>
         Loading…
+      </div>
+    );
+  }
+
+  if (loadErr || !s) {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: font, color: C.muted, fontSize: 14, fontWeight: 600, background: C.bg, gap: 8 }}>
+        <div style={{ color: C.red }}>Failed to load settings</div>
+        {loadErr && <div style={{ fontSize: 12, color: C.muted, maxWidth: 400, textAlign: "center" }}>{loadErr}</div>}
       </div>
     );
   }
@@ -189,6 +248,14 @@ export default function LeadershipSettings() {
   return (
     <div style={{ flex: 1, overflowY: "auto", background: C.bg, fontFamily: font, color: C.text }}>
       <div style={{ maxWidth: 820, margin: "0 auto", padding: "28px 32px 56px" }}>
+
+        {/* Connected banner */}
+        {connectedBanner && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.greenLt, border: `1.5px solid ${C.green}`, borderRadius: 12, padding: "12px 16px", marginBottom: 20 }}>
+            <span style={{ fontSize: 16 }}>✓</span>
+            <span style={{ fontSize: 13, fontWeight: 700, color: "#15803D" }}>Google Account connected — you can now sync to Sheets.</span>
+          </div>
+        )}
 
         {/* Page header */}
         <div style={{ marginBottom: 24 }}>
@@ -202,15 +269,29 @@ export default function LeadershipSettings() {
           {/* Connection status */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px", background: C.bg, borderRadius: 10, marginBottom: 20, border: `1px solid ${C.border}` }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#D1D5DB", flexShrink: 0 }} />
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: s.google_email ? C.green : "#D1D5DB", flexShrink: 0 }} />
               <div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Google Account</div>
-                <div style={{ fontSize: 11, color: C.muted, fontWeight: 500 }}>Not connected · OAuth will be configured in Phase 7</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
+                  {s.google_email ? "Google Account Connected" : "Google Account"}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, fontWeight: 500 }}>
+                  {s.google_email ?? "Not connected"}
+                </div>
               </div>
             </div>
-            <button disabled style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "7px 16px", fontFamily: font, fontSize: 12, fontWeight: 700, color: C.muted, cursor: "not-allowed", opacity: 0.7 }}>
-              Connect Google Account
-            </button>
+            {s.google_email ? (
+              <button
+                onClick={disconnectGoogle}
+                style={{ background: C.redLt, border: `1.5px solid #FCA5A5`, borderRadius: 8, padding: "7px 16px", fontFamily: font, fontSize: 12, fontWeight: 700, color: C.red, cursor: "pointer" }}>
+                Disconnect
+              </button>
+            ) : (
+              <button
+                onClick={() => { window.location.href = "/api/google/connect"; }}
+                style={{ background: C.sageDk, border: "none", borderRadius: 8, padding: "7px 16px", fontFamily: font, fontSize: 12, fontWeight: 700, color: "white", cursor: "pointer" }}>
+                Connect Google Account
+              </button>
+            )}
           </div>
 
           <Row label="Spreadsheet URL" sub="Paste the URL of your Google Sheet">
@@ -272,13 +353,18 @@ export default function LeadershipSettings() {
           <div style={{ marginTop: 18, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
             <div style={{ background: C.bg, padding: "8px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted }}>Sync Log</span>
-              <button disabled style={{ background: C.sage, border: "none", borderRadius: 6, padding: "4px 14px", fontFamily: font, fontSize: 11, fontWeight: 700, color: "white", cursor: "not-allowed", opacity: 0.6 }}>
-                Sync Now
+              <button
+                onClick={syncNow}
+                disabled={syncing || !s.google_email || !s.sheets_url}
+                style={{ background: C.sage, border: "none", borderRadius: 6, padding: "4px 14px", fontFamily: font, fontSize: 11, fontWeight: 700, color: "white", cursor: (syncing || !s.google_email || !s.sheets_url) ? "not-allowed" : "pointer", opacity: (syncing || !s.google_email || !s.sheets_url) ? 0.5 : 1, transition: "opacity 0.15s" }}>
+                {syncing ? "Syncing…" : "Sync Now"}
               </button>
             </div>
-            <div style={{ padding: 14, background: "white", minHeight: 60, fontFamily: "monospace", fontSize: 11, color: C.muted, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
-              {s.last_synced_at
-                ? `[${new Date(s.last_synced_at).toLocaleString()}] Sync completed\nGoogle Sheets integration will be enabled in Phase 7.`
+            <div style={{ padding: 14, background: "white", minHeight: 60, maxHeight: 160, overflowY: "auto", fontFamily: "monospace", fontSize: 11, color: C.muted, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
+              {syncLog.length > 0
+                ? syncLog.join("\n")
+                : s.last_synced_at
+                ? `[${new Date(s.last_synced_at).toLocaleString()}] Last sync completed`
                 : "No sync history. Connect a Google Account to begin syncing."}
             </div>
           </div>

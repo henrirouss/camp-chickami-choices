@@ -310,6 +310,12 @@ export default function CounselorPage({ group }: { group: string }) {
       .update({ submitted: true, submitted_at: new Date().toISOString() })
       .eq("id", groupRow.id);
     setSubmitted(true);
+    // Fire-and-forget; server checks auto_sync flag before writing
+    fetch("/api/google/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto: true }),
+    }).catch(() => {});
   }
 
   // Whether an activity is closed for the slot currently being filled
