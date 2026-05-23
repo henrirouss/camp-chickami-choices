@@ -352,28 +352,95 @@ export default function LiveAttendancePage() {
   const [period,        setPeriod]        = useState<1 | 2 | 3>(() => detectPeriod());
   const [expandedAct,   setExpandedAct]   = useState<string | null>(null);
   const [rightTab,      setRightTab]      = useState<"feed" | "changes" | "unaccounted">("feed");
-  const [showAll,       setShowAll]       = useState(false);
-  const [locateCtx,     setLocateCtx]     = useState<LocateCtx | null>(null);
-  const [dismissed,     setDismissed]     = useState<Set<string>>(new Set());
-  const [searchQuery,   setSearchQuery]   = useState("");
-  const [searchFocused, setSearchFocused] = useState(false);
-  const searchRef = useRef<HTMLInputElement>(null);
-  const cardRefs  = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [showAll,          setShowAll]          = useState(false);
+  const [locateCtx,        setLocateCtx]        = useState<LocateCtx | null>(null);
+  const [dismissed,        setDismissed]        = useState<Set<string>>(new Set());
+  const [searchQuery,      setSearchQuery]      = useState("");
+  const [searchFocused,    setSearchFocused]    = useState(false);
+  const [periodManuallySet,setPeriodManuallySet] = useState(false);
+  const searchRef  = useRef<HTMLInputElement>(null);
+  const cardRefs   = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Stable refs so callbacks don't re-create on every camper/activity state change
+  const campersRef    = useRef<Camper[]>([]);
+  const activitiesRef = useRef<Activity[]>([]);
+  useEffect(() => { campersRef.current    = campers;    }, [campers]);
+  useEffect(() => { activitiesRef.current = activities; }, [activities]);
 
-  // ── Load ────────────────────────────────────────────────────────────────────
-  const refreshAttendance = useCallback(async () => {
+  // ── Load helpers ──────────────────────────────────────────────────────────
+  const mapAttRec = (r: DBAttRec): AttRec => ({
+    id: r.id, camperId: r.camper_id, activityId: r.activity_id,
+    period: r.period, status: r.status, location: r.location,
+    loggedBy: r.logged_by, loggedAt: r.logged_at,
+  });
+
+  const fetchAttendance = useCallback(async (): Promise<AttRec[]> => {
     const { data } = await supabase
       .from("attendance")
       .select("id, camper_id, activity_id, period, status, location, logged_by, logged_at")
       .order("logged_at", { ascending: false });
-    if (data) {
-      setAttendance((data as DBAttRec[]).map(r => ({
-        id: r.id, camperId: r.camper_id, activityId: r.activity_id,
-        period: r.period, status: r.status, location: r.location,
-        loggedBy: r.logged_by, loggedAt: r.logged_at,
-      })));
-    }
+    return (data as DBAttRec[] | null ?? []).map(mapAttRec);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supabase]);
+
+  // Write missing flags for ended periods; auto-clear when camper is now accounted for
+  const syncMissingFlags = useCallback(async (freshAtt: AttRec[]) => {
+    const cs = campersRef.current;
+    const as_ = activitiesRef.current;
+    if (!cs.length || !as_.length) return;
+
+    let didWrite = false;
+
+    for (let p = 1; p <= 3; p++) {
+      const pNum = p as 1 | 2 | 3;
+      if (!periodEnded(pNum)) continue;
+
+      const pKey  = `choiceP${p}` as "choiceP1" | "choiceP2" | "choiceP3";
+      const pAtt  = freshAtt.filter(r => r.period === p);
+      // Campers with a real (non-missing) record
+      const realIds    = new Set(pAtt.filter(r => r.status !== "missing").map(r => r.camperId));
+      // Existing missing records: camperId → recordId
+      const missingRec = new Map(pAtt.filter(r => r.status === "missing").map(r => [r.camperId, r.id]));
+
+      // 1. Auto-clear missing records for campers who are now accounted for
+      const toClear = [...missingRec.entries()].filter(([cid]) => realIds.has(cid));
+      for (const [, recId] of toClear) {
+        await supabase.from("attendance").delete().eq("id", recId);
+        didWrite = true;
+      }
+
+      // 2. Insert missing flags for newly missing campers
+      const expected = cs.filter(c => c[pKey]);
+      const toFlag   = expected.filter(c => !realIds.has(c.id) && !missingRec.has(c.id));
+      if (toFlag.length > 0) {
+        const inserts = toFlag
+          .map(c => ({
+            camper_id:   c.id,
+            activity_id: as_.find(a => a.name === c[pKey])?.id ?? null,
+            period:      p,
+            status:      "missing",
+            logged_at:   new Date().toISOString(),
+            logged_by:   "system",
+          }))
+          .filter(r => r.activity_id);
+        if (inserts.length > 0) {
+          await supabase.from("attendance").insert(inserts);
+          didWrite = true;
+        }
+      }
+    }
+    return didWrite;
+  }, [supabase]);
+
+  const refreshAndSync = useCallback(async () => {
+    const freshAtt = await fetchAttendance();
+    setAttendance(freshAtt);
+    const wrote = await syncMissingFlags(freshAtt);
+    // Re-fetch only when missing flags were written/cleared so new records appear
+    if (wrote) {
+      const updatedAtt = await fetchAttendance();
+      setAttendance(updatedAtt);
+    }
+  }, [fetchAttendance, syncMissingFlags]);
 
   useEffect(() => {
     async function init() {
@@ -393,17 +460,27 @@ export default function LiveAttendancePage() {
           choiceP1: c.choice_p1 ?? "", choiceP2: c.choice_p2 ?? "", choiceP3: c.choice_p3 ?? "",
         })));
       }
-      await refreshAttendance();
+      await refreshAndSync();
       setLoading(false);
     }
     init();
-  }, [supabase, refreshAttendance]);
+  // refreshAndSync is stable once campers/activities are loaded; init runs once
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase]);
 
-  // 10-second refresh
+  // 10-second attendance refresh + missing-flag sync
   useEffect(() => {
-    const t = setInterval(refreshAttendance, 10_000);
+    const t = setInterval(refreshAndSync, 10_000);
     return () => clearInterval(t);
-  }, [refreshAttendance]);
+  }, [refreshAndSync]);
+
+  // 1-minute period auto-detection
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (!periodManuallySet) setPeriod(detectPeriod());
+    }, 60_000);
+    return () => clearInterval(t);
+  }, [periodManuallySet]);
 
   // ── Derived: per-activity stats ───────────────────────────────────────────
   const actMap    = useMemo(() => new Map(activities.map(a => [a.id, a])),  [activities]);
@@ -474,7 +551,10 @@ export default function LiveAttendancePage() {
 
   // ── Derived: unaccounted ──────────────────────────────────────────────────
   const unaccounted = useMemo<Camper[]>(() => {
-    const accountedIds = new Set(periodAtt.map(r => r.camperId));
+    // Exclude "missing" records — those campers are still unaccounted for
+    const accountedIds = new Set(
+      periodAtt.filter(r => r.status !== "missing").map(r => r.camperId)
+    );
     return campers
       .filter(c => c[choiceKey] && !accountedIds.has(c.id))
       .sort((a, b) => a.lastName.localeCompare(b.lastName));
@@ -493,7 +573,12 @@ export default function LiveAttendancePage() {
       const actName = actMap.get(r.activityId)?.name ?? "Unknown";
       const name    = camper ? `${camper.lastName}, ${camper.firstName}` : "Unknown";
       const group   = camper?.groupName ?? "";
-      if (r.loggedBy === "counselor_unexpected") {
+      // Missing flags come from DB records written by syncMissingFlags
+      if (r.status === "missing") {
+        if (!dismissed.has(r.id)) {
+          events.push({ id: r.id, type: "missing", camperName: name, groupName: group, activityName: actName, detail: "not accounted for", loggedAt: r.loggedAt, period: r.period, dismissible: true });
+        }
+      } else if (r.loggedBy === "counselor_unexpected") {
         events.push({ id: r.id, type: "unexpected", camperName: name, groupName: group, activityName: actName, detail: "unexpected arrival", loggedAt: r.loggedAt, period: r.period, dismissible: false });
       } else if (r.status === "pickup") {
         events.push({ id: r.id, type: "pickup", camperName: name, groupName: group, activityName: actName, detail: "early pickup", loggedAt: r.loggedAt, period: r.period, dismissible: false });
@@ -503,24 +588,13 @@ export default function LiveAttendancePage() {
         events.push({ id: r.id, type: "checkin", camperName: name, groupName: group, activityName: actName, detail: "checked in", loggedAt: r.loggedAt, period: r.period, dismissible: false });
       }
     }
-    // Missing flags when period ended
-    if (periodEnded(period)) {
-      for (const s of stats) {
-        for (const c of s.missing) {
-          const evId = `missing-${c.id}`;
-          if (!dismissed.has(evId)) {
-            events.push({ id: evId, type: "missing", camperName: `${c.lastName}, ${c.firstName}`, groupName: c.groupName, activityName: s.activity.name, detail: "not accounted for", loggedAt: null, period, dismissible: true });
-          }
-        }
-      }
-    }
     return events.sort((a, b) => {
       if (!a.loggedAt && !b.loggedAt) return 0;
       if (!a.loggedAt) return -1;
       if (!b.loggedAt) return 1;
       return new Date(b.loggedAt).getTime() - new Date(a.loggedAt).getTime();
     });
-  }, [attendance, actMap, camperMap, stats, period, dismissed]);
+  }, [attendance, actMap, camperMap, dismissed]);
 
   const checkInsCount = useMemo(
     () => periodAtt.filter(r => r.status === "checkedin").length,
@@ -554,13 +628,13 @@ export default function LiveAttendancePage() {
       )
       .map(camper => {
         const expectedActivity = camper[choiceKey];
-        const rec = periodAtt.find(r => r.camperId === camper.id);
+        const rec = periodAtt.find(r => r.camperId === camper.id && r.status !== "missing");
         let status = "missing", location = expectedActivity || "—";
         if (rec) {
           status   = rec.status;
-          location = rec.status === "checkedin"   ? (actMap.get(rec.activityId)?.name ?? location)
-                   : rec.status === "elsewhere"   ? (rec.location ?? location)
-                   : rec.status === "pickup"       ? "Picked up"
+          location = rec.status === "checkedin" ? (actMap.get(rec.activityId)?.name ?? location)
+                   : rec.status === "elsewhere" ? (rec.location ?? location)
+                   : rec.status === "pickup"    ? "Picked up"
                    : location;
         }
         return { camper, status, location, expectedActivity: expectedActivity || "—" };
@@ -587,7 +661,7 @@ export default function LiveAttendancePage() {
       logged_at:   new Date().toISOString(),
       logged_by:   "leadership",
     });
-    await refreshAttendance();
+    await refreshAndSync();
   }
 
   async function directPickup(camper: Camper) {
@@ -600,7 +674,7 @@ export default function LiveAttendancePage() {
       camper_id: camper.id, activity_id: actId, period,
       status: "pickup", logged_at: new Date().toISOString(), logged_by: "leadership",
     });
-    await refreshAttendance();
+    await refreshAndSync();
   }
 
   function openLocate(camperOrCtx: Camper | LocateCtx) {
@@ -646,7 +720,7 @@ export default function LiveAttendancePage() {
         {/* Period switcher */}
         <div style={{ display: "flex", gap: 4, background: "rgba(0,0,0,0.2)", borderRadius: 8, padding: 3 }}>
           {([1, 2, 3] as const).map(p => (
-            <button key={p} onClick={() => setPeriod(p)} style={{
+            <button key={p} onClick={() => { setPeriod(p); setPeriodManuallySet(true); }} style={{
               border: "none", borderRadius: 6, padding: "4px 14px", fontFamily: font,
               fontSize: 12, fontWeight: 800, cursor: "pointer", position: "relative",
               background: period === p ? C.white : "transparent",
