@@ -1,7 +1,10 @@
-export default function AttendancePage({
+import AttendancePage from "@/components/attendance/AttendancePage";
+
+export default async function Page({
   params,
 }: {
   params: Promise<{ activity: string; period: string }>;
 }) {
-  return <div />;
+  const { activity, period } = await params;
+  return <AttendancePage activitySlug={activity} periodStr={period} />;
 }
