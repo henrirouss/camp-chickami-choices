@@ -162,6 +162,8 @@ export default function LeadershipSettings() {
 
   // ── CSV helpers ───────────────────────────────────────────────────────────
   async function parseCsv(text: string) {
+    function stripGroupPrefix(raw: string) { return raw.trim().replace(/^group\s+/i, "").trim(); }
+
     setCsvMsg(null);
     const lines = text.trim().split("\n").filter(l => l.trim());
     const hdr   = lines[0]?.toLowerCase() ?? "";
@@ -170,25 +172,35 @@ export default function LeadershipSettings() {
     }
     const rows = lines.slice(1).map(line => {
       const [fn, ln, grp] = line.split(",").map(v => v.trim());
-      return { fn, ln: ln ?? "", grp: (grp ?? "").toUpperCase() };
+      return { fn, ln: ln ?? "", grp: stripGroupPrefix(grp ?? "") };
     }).filter(r => r.fn && r.grp);
 
     const { data: dbGroups } = await supabase.from("groups").select("id, name");
-    const gMap = new Map((dbGroups as { id: string; name: string }[] | null ?? []).map(g => [g.name, g.id]));
+    // Case-insensitive lookup: lowercase → {id, name}
+    const gLookup = new Map(
+      (dbGroups as { id: string; name: string }[] | null ?? []).map(g => [g.name.toLowerCase(), { id: g.id, name: g.name }])
+    );
 
-    const missing = [...new Set(rows.map(r => r.grp))].filter(n => !gMap.has(n));
-    if (missing.length) {
-      const { data: newGs } = await supabase.from("groups").insert(missing.map(name => ({ name }))).select("id, name");
-      (newGs as { id: string; name: string }[] | null)?.forEach(g => gMap.set(g.name, g.id));
+    const missingNorms = [...new Set(rows.map(r => r.grp.toLowerCase()))].filter(n => !gLookup.has(n));
+    if (missingNorms.length) {
+      const canonicals = missingNorms.map(n => rows.find(r => r.grp.toLowerCase() === n)!.grp);
+      const { data: newGs } = await supabase.from("groups").insert(canonicals.map(name => ({ name }))).select("id, name");
+      (newGs as { id: string; name: string }[] | null)?.forEach(g => gLookup.set(g.name.toLowerCase(), { id: g.id, name: g.name }));
     }
 
-    if (gMap.size > 0) await supabase.from("campers").delete().in("group_id", [...gMap.values()]);
+    const allIds = [...gLookup.values()].map(g => g.id);
+    if (allIds.length > 0) await supabase.from("campers").delete().in("group_id", allIds);
 
-    const toInsert = rows.filter(r => gMap.has(r.grp))
-      .map(r => ({ first_name: r.fn, last_name: r.ln, group_id: gMap.get(r.grp)!, absent: false }));
+    const toInsert = rows
+      .map(r => {
+        const entry = gLookup.get(r.grp.toLowerCase());
+        return entry ? { first_name: r.fn, last_name: r.ln, group_id: entry.id, absent: false } : null;
+      })
+      .filter(Boolean) as { first_name: string; last_name: string; group_id: string; absent: boolean }[];
     if (toInsert.length) await supabase.from("campers").insert(toInsert);
 
-    setCsvMsg(`✓ Imported ${toInsert.length} campers across ${new Set(rows.map(r => r.grp)).size} groups`);
+    const groupCount = new Set(rows.map(r => r.grp.toLowerCase())).size;
+    setCsvMsg(`✓ Imported ${toInsert.length} campers across ${groupCount} groups`);
   }
 
   async function exportCsv() {
@@ -454,7 +466,7 @@ export default function LeadershipSettings() {
               <div style={{ fontSize: 22, flexShrink: 0 }}>📄</div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Drop CSV here or click to browse</div>
-                <div style={{ fontSize: 11, color: C.muted }}>Columns: first_name, last_name, group — replaces current roster</div>
+                <div style={{ fontSize: 11, color: C.muted }}>Columns: first_name, last_name, group — group can be &quot;Birch&quot; or &quot;Group Birch&quot;</div>
               </div>
               <button onClick={e => { e.stopPropagation(); csvRef.current?.click(); }}
                 style={{ background: C.sage, border: "none", borderRadius: 8, padding: "7px 14px", fontFamily: font, fontSize: 11, fontWeight: 700, color: "white", cursor: "pointer", flexShrink: 0 }}>Browse</button>

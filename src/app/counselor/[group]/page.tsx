@@ -6,5 +6,5 @@ export default async function CounselorGroupPage({
   params: Promise<{ group: string }>;
 }) {
   const { group } = await params;
-  return <CounselorPage group={group.toUpperCase()} />;
+  return <CounselorPage group={decodeURIComponent(group)} />;
 }

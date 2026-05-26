@@ -21,14 +21,14 @@ const font = "var(--font-figtree), Figtree, sans-serif";
 type Choices  = [string, string, string];
 type Camper   = { id: string; firstName: string; lastName: string; choices: Choices; absent: boolean };
 type Group    = { id: string; name: string; counselor: string; submitted: boolean; campers: Camper[] };
-type Activity = { id: string; name: string; abbreviation: string; open: [boolean, boolean, boolean] };
+type Activity = { id: string; name: string; abbreviation: string; open: [boolean, boolean, boolean]; capacity: [number | null, number | null, number | null] };
 type Tab      = "grid" | "activities" | "roster" | "upload";
 
 // ── DB row types ──────────────────────────────────────────────────────────────
 
 type DBGroup    = { id: string; name: string; counselor_name: string | null; submitted: boolean };
 type DBCamper   = { id: string; first_name: string; last_name: string; group_id: string; absent: boolean; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null };
-type DBActivity = { id: string; name: string; abbreviation: string; open_p1: boolean; open_p2: boolean; open_p3: boolean };
+type DBActivity = { id: string; name: string; abbreviation: string; open_p1: boolean; open_p2: boolean; open_p3: boolean; capacity_p1: number | null; capacity_p2: number | null; capacity_p3: number | null };
 
 // ── Converters ────────────────────────────────────────────────────────────────
 
@@ -74,6 +74,8 @@ export default function LeadershipDashboard() {
   const [movingCamper, setMovingCamper] = useState<{ gi: number; ci: number } | null>(null);
   const [moveTarget, setMoveTarget] = useState(0);
   const [alertDismissed, setAlertDismissed] = useState(false);
+  const [editCamperCtx, setEditCamperCtx] = useState<{ id: string; firstName: string; lastName: string; groupName: string } | null>(null);
+  const [editChoices, setEditChoices] = useState<Choices>(["", "", ""]);
   const [schedFileName, setSchedFileName]   = useState<string | null>(null);
   const settingsId = useRef<string | null>(null);
   const csvRef   = useRef<HTMLInputElement>(null);
@@ -84,7 +86,7 @@ export default function LeadershipDashboard() {
     const [gRes, cRes, aRes, sRes] = await Promise.all([
       supabase.from("groups").select("id, name, counselor_name, submitted").order("name"),
       supabase.from("campers").select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3"),
-      supabase.from("activities").select("id, name, abbreviation, open_p1, open_p2, open_p3").order("name"),
+      supabase.from("activities").select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3").order("name"),
       supabase.from("settings").select("id").limit(1).maybeSingle(),
     ]);
 
@@ -95,6 +97,7 @@ export default function LeadershipDashboard() {
       setActivities((aRes.data as DBActivity[]).map(a => ({
         id: a.id, name: a.name, abbreviation: a.abbreviation,
         open: [a.open_p1, a.open_p2, a.open_p3],
+        capacity: [a.capacity_p1, a.capacity_p2, a.capacity_p3],
       })));
     }
     if (sRes.data) {
@@ -169,6 +172,40 @@ export default function LeadershipDashboard() {
     await supabase.from("activities").update({ open_p1: val, open_p2: val, open_p3: val }).eq("id", act.id);
   }
 
+  async function setCapacity(ai: number, pi: number, val: number | null) {
+    const act = activities[ai];
+    setActivities(prev => prev.map((a, i) => i !== ai ? a : {
+      ...a, capacity: a.capacity.map((c, j) => j === pi ? val : c) as [number | null, number | null, number | null],
+    }));
+    const field = (["capacity_p1", "capacity_p2", "capacity_p3"] as const)[pi];
+    await supabase.from("activities").update({ [field]: val }).eq("id", act.id);
+  }
+
+  // ── Derived: signup counts per activity per period ────────────────────────
+  const signupCounts = useMemo(() => {
+    const counts: Record<string, [number, number, number]> = {};
+    groups.forEach(g => g.campers.forEach(c =>
+      c.choices.forEach((act, pi) => {
+        if (act) {
+          if (!counts[act]) counts[act] = [0, 0, 0];
+          counts[act][pi]++;
+        }
+      })
+    ));
+    return counts;
+  }, [groups]);
+
+  function hasOverCapacity(g: Group): boolean {
+    return g.campers.some(c =>
+      c.choices.some((act, pi) => {
+        if (!act) return false;
+        const a = activities.find(x => x.name === act);
+        if (!a || a.capacity[pi] === null) return false;
+        return (signupCounts[act]?.[pi] ?? 0) > a.capacity[pi]!;
+      })
+    );
+  }
+
   // ── Roster manager ────────────────────────────────────────────────────────
   async function removeCamper(gi: number, ci: number) {
     const camper = groups[gi].campers[ci];
@@ -201,6 +238,26 @@ export default function LeadershipDashboard() {
     }
   }
 
+  function openEdit(c: Camper, g: Group) {
+    setEditCamperCtx({ id: c.id, firstName: c.firstName, lastName: c.lastName, groupName: g.name });
+    setEditChoices([...c.choices] as Choices);
+  }
+
+  async function saveEdit() {
+    if (!editCamperCtx) return;
+    const { id } = editCamperCtx;
+    setGroups(prev => prev.map(g => ({
+      ...g,
+      campers: g.campers.map(c => c.id !== id ? c : { ...c, choices: editChoices }),
+    })));
+    await supabase.from("campers").update({
+      choice_p1: editChoices[0] || null,
+      choice_p2: editChoices[1] || null,
+      choice_p3: editChoices[2] || null,
+    }).eq("id", id);
+    setEditCamperCtx(null);
+  }
+
   async function confirmMove() {
     if (!movingCamper) return;
     const { gi, ci }   = movingCamper;
@@ -218,6 +275,8 @@ export default function LeadershipDashboard() {
 
   // ── CSV parse + roster replace ────────────────────────────────────────────
   async function parseCsv(text: string) {
+    function stripGroupPrefix(raw: string) { return raw.trim().replace(/^group\s+/i, "").trim(); }
+
     const lines = text.trim().split("\n").filter(l => l.trim());
     const hdr   = lines[0].toLowerCase();
     if (!hdr.includes("first") || !hdr.includes("group")) {
@@ -226,30 +285,33 @@ export default function LeadershipDashboard() {
     }
     const rows = lines.slice(1).map(line => {
       const [fn, ln, grp] = line.split(",").map(s => s.trim());
-      return { fn, ln: ln ?? "", grp: (grp ?? "").toUpperCase() };
+      return { fn, ln: ln ?? "", grp: stripGroupPrefix(grp ?? "") };
     }).filter(r => r.fn && r.grp);
 
-    // Build name → id map from current groups state
-    const groupMap = new Map(groups.map(g => [g.name, g.id]));
+    // Case-insensitive lookup: lowercase name → {id, name}
+    const gLookup = new Map(groups.map(g => [g.name.toLowerCase(), { id: g.id, name: g.name }]));
 
-    // Insert any groups from CSV that don't exist yet
-    const missingNames = [...new Set(rows.map(r => r.grp))].filter(n => !groupMap.has(n));
-    if (missingNames.length > 0) {
+    // Insert groups from CSV missing from DB (matched case-insensitively)
+    const missingNorms = [...new Set(rows.map(r => r.grp.toLowerCase()))].filter(n => !gLookup.has(n));
+    if (missingNorms.length > 0) {
+      const canonicals = missingNorms.map(n => rows.find(r => r.grp.toLowerCase() === n)!.grp);
       const { data: newGroups } = await supabase
-        .from("groups")
-        .insert(missingNames.map(name => ({ name })))
-        .select("id, name");
+        .from("groups").insert(canonicals.map(name => ({ name }))).select("id, name");
       (newGroups as { id: string; name: string }[] | null)
-        ?.forEach(g => groupMap.set(g.name, g.id));
+        ?.forEach(g => gLookup.set(g.name.toLowerCase(), { id: g.id, name: g.name }));
     }
 
     // Delete all current campers then insert fresh roster
-    if (groupMap.size > 0) {
-      await supabase.from("campers").delete().in("group_id", [...groupMap.values()]);
+    const allIds = [...gLookup.values()].map(g => g.id);
+    if (allIds.length > 0) {
+      await supabase.from("campers").delete().in("group_id", allIds);
     }
     const toInsert = rows
-      .filter(r => groupMap.has(r.grp))
-      .map(r => ({ first_name: r.fn, last_name: r.ln, group_id: groupMap.get(r.grp)!, absent: false }));
+      .map(r => {
+        const entry = gLookup.get(r.grp.toLowerCase());
+        return entry ? { first_name: r.fn, last_name: r.ln, group_id: entry.id, absent: false } : null;
+      })
+      .filter(Boolean) as { first_name: string; last_name: string; group_id: string; absent: boolean }[];
     if (toInsert.length > 0) {
       await supabase.from("campers").insert(toInsert);
     }
@@ -359,7 +421,7 @@ export default function LeadershipDashboard() {
                   onMouseLeave={e => (e.currentTarget.style.background = "transparent")}>
                   <div style={dotStyle(st)} />
                   <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(255,255,255,0.8)", flex: 1 }}>
-                    Group {g.name}{g.counselor ? ` · ${g.counselor.split(" ")[0]}` : ""}
+                    {g.name}{g.counselor ? ` · ${g.counselor.split(" ")[0]}` : ""}
                   </div>
                   <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", color: stColor }}>{stLabel}</div>
                 </div>
@@ -403,10 +465,11 @@ export default function LeadershipDashboard() {
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
                   {groups.map(g => {
-                    const hasConflict = g.campers.some(c => c.choices.some((act, pi) => isConflict(act, pi)));
-                    const st          = groupStatus(g);
-                    const cardBg      = g.submitted ? "#FAFFFA" : hasConflict ? C.yellowLt : C.white;
-                    const cardBorder  = g.submitted ? C.sage    : hasConflict ? C.yellow   : C.border;
+                    const hasConflict  = g.campers.some(c => c.choices.some((act, pi) => isConflict(act, pi)));
+                    const hasCapWarn   = hasOverCapacity(g);
+                    const st           = groupStatus(g);
+                    const cardBg       = g.submitted ? "#FAFFFA" : (hasConflict || hasCapWarn) ? C.yellowLt : C.white;
+                    const cardBorder   = g.submitted ? C.sage    : (hasConflict || hasCapWarn) ? C.yellow   : C.border;
                     const dotBg       = st === "done" ? C.green : st === "partial" ? C.yellow : C.border;
                     const sorted      = [...g.campers].sort((a, b) => a.lastName.localeCompare(b.lastName));
                     const MAX         = 4;
@@ -416,14 +479,22 @@ export default function LeadershipDashboard() {
                         onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.boxShadow = "none"; }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                           <div>
-                            <div style={{ fontSize: 14, fontWeight: 800 }}>Group {g.name}</div>
+                            <div style={{ fontSize: 14, fontWeight: 800, display: "flex", alignItems: "center", gap: 5 }}>
+                              {g.name}
+                              {hasCapWarn && !g.submitted && <span style={{ fontSize: 8, fontWeight: 900, background: C.redLt, color: C.red, padding: "1px 5px", borderRadius: 99 }}>Over cap</span>}
+                            </div>
                             <div style={{ fontSize: 10, fontWeight: 600, color: C.muted }}>{g.counselor || "No counselor yet"}</div>
                           </div>
                           <div style={{ width: 8, height: 8, borderRadius: "50%", background: dotBg }} />
                         </div>
                         <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                           {sorted.slice(0, MAX).map(c => (
-                            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+                            <div key={c.id}
+                              onClick={e => { e.stopPropagation(); openEdit(c, g); }}
+                              style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, borderRadius: 4, padding: "1px 3px", margin: "0 -3px", cursor: "pointer" }}
+                              onMouseEnter={e => (e.currentTarget.style.background = C.sageLt)}
+                              onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                            >
                               <div style={{ fontWeight: 600, flex: 1, color: C.text }}>{c.firstName} {c.lastName}</div>
                               {c.absent
                                 ? <span style={{ fontSize: 9, fontWeight: 700, background: "#F3E8FF", color: "#7E22CE", padding: "1px 5px", borderRadius: 99 }}>Absent</span>
@@ -455,16 +526,19 @@ export default function LeadershipDashboard() {
                   <div style={{ fontSize: 12, fontWeight: 500, color: C.muted, marginTop: 1 }}>Toggle activities open or closed per period · Conflicts flagged automatically</div>
                 </div>
                 <div style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 100px 100px 100px 120px", background: C.bg, borderBottom: `1.5px solid ${C.border}`, padding: "10px 16px" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 120px 120px 120px", background: C.bg, borderBottom: `1.5px solid ${C.border}`, padding: "10px 16px" }}>
                     {["Activity", "Period 1", "Period 2", "Period 3", "Shortcuts"].map((h, i) => (
-                      <div key={h} style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, textAlign: i === 0 ? "left" : "center" }}>{h}</div>
+                      <div key={h} style={{ textAlign: i === 0 ? "left" : "center" }}>
+                        <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted }}>{h}</div>
+                        {i > 0 && i < 4 && <div style={{ fontSize: 8, fontWeight: 600, color: C.muted, marginTop: 1, letterSpacing: "0.04em" }}>on/off · max</div>}
+                      </div>
                     ))}
                   </div>
                   {activities.map((act, ai) => {
                     const actConflicts = conflicts.filter(c => c.act === act.name);
                     const allOpen      = act.open.every(v => v);
                     return (
-                      <div key={act.id} style={{ display: "grid", gridTemplateColumns: "1fr 100px 100px 100px 120px", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
+                      <div key={act.id} style={{ display: "grid", gridTemplateColumns: "1fr 120px 120px 120px 120px", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
                           {act.name}
                           {actConflicts.length > 0 && (
@@ -474,8 +548,23 @@ export default function LeadershipDashboard() {
                           )}
                         </div>
                         {[0, 1, 2].map(pi => (
-                          <div key={pi} style={{ display: "flex", justifyContent: "center" }}>
+                          <div key={pi} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5 }}>
                             <Toggle on={act.open[pi]} onToggle={() => toggleActivity(ai, pi)} />
+                            <input
+                              key={`${act.id}-${pi}-${act.capacity[pi]}`}
+                              type="number"
+                              min={0}
+                              placeholder="∞"
+                              defaultValue={act.capacity[pi] ?? ""}
+                              onFocus={e => (e.target.style.borderColor = C.sage)}
+                              onBlur={e => {
+                                (e.target as HTMLInputElement).style.borderColor = C.border;
+                                const v = (e.target as HTMLInputElement).value.trim();
+                                const parsed = parseInt(v, 10);
+                                setCapacity(ai, pi, v === "" || isNaN(parsed) ? null : Math.max(0, parsed));
+                              }}
+                              style={{ width: 48, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, padding: "3px 6px", fontFamily: font, fontSize: 11, fontWeight: 700, color: C.text, textAlign: "center", outline: "none" }}
+                            />
                           </div>
                         ))}
                         <div style={{ display: "flex", justifyContent: "center" }}>
@@ -504,7 +593,7 @@ export default function LeadershipDashboard() {
                     return (
                       <div key={g.id} style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
                         <div style={{ background: C.sageLt, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `1px solid ${C.border}` }}>
-                          <span style={{ fontSize: 13, fontWeight: 800, color: C.sageDk }}>Group {g.name}</span>
+                          <span style={{ fontSize: 13, fontWeight: 800, color: C.sageDk }}>{g.name}</span>
                           <span style={{ fontSize: 11, fontWeight: 600, color: C.sage }}>{g.campers.length} campers</span>
                         </div>
                         <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 2 }}>
@@ -515,6 +604,13 @@ export default function LeadershipDashboard() {
                                 onMouseEnter={e => (e.currentTarget.style.background = C.bg)}
                                 onMouseLeave={e => (e.currentTarget.style.background = "transparent")}>
                                 <span style={{ fontSize: 12, fontWeight: 600, flex: 1, color: C.text }}>{c.firstName} {c.lastName}</span>
+                                <button
+                                  onClick={() => openEdit(c, g)}
+                                  title="Edit schedule"
+                                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: C.muted, padding: "2px 4px", borderRadius: 4, fontFamily: font }}
+                                  onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = C.sageLt; (e.currentTarget as HTMLButtonElement).style.color = C.sageDk; }}
+                                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "none"; (e.currentTarget as HTMLButtonElement).style.color = C.muted; }}
+                                >✎</button>
                                 <button
                                   onClick={() => { setMovingCamper({ gi, ci: realIdx }); setMoveTarget(gi === 0 ? 1 : 0); }}
                                   title="Move to another group"
@@ -588,9 +684,9 @@ export default function LeadershipDashboard() {
                       <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 6 }}>Expected CSV Format</div>
                       <div style={{ fontFamily: "monospace", fontSize: 11, color: C.text, lineHeight: 1.6 }}>
                         first_name, last_name, group<br />
-                        Emma, Anderson, A<br />
-                        Jake, Barnes, A<br />
-                        Sofia, Campbell, B
+                        Emma, Anderson, Birch<br />
+                        Jake, Barnes, Birch<br />
+                        Sofia, Campbell, Oak
                       </div>
                     </div>
                   </div>
@@ -630,6 +726,35 @@ export default function LeadershipDashboard() {
         </div>
       </div>
 
+      {/* ── Edit schedule modal ── */}
+      {editCamperCtx && (
+        <div onClick={e => { if (e.target === e.currentTarget) setEditCamperCtx(null); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ background: C.white, borderRadius: 16, width: 400, padding: 24, boxShadow: "0 20px 60px rgba(0,0,0,0.2)", fontFamily: font }}>
+            <div style={{ fontSize: 17, fontWeight: 800, marginBottom: 4 }}>Edit Schedule</div>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>{editCamperCtx.firstName} {editCamperCtx.lastName} · {editCamperCtx.groupName}</div>
+            {(["Period 1", "Period 2", "Period 3"] as const).map((label, pi) => (
+              <div key={pi} style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>{label}</div>
+                <select
+                  value={editChoices[pi]}
+                  onChange={e => { const v = e.target.value; setEditChoices(prev => prev.map((c, i) => i === pi ? v : c) as Choices); }}
+                  style={{ width: "100%", background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", fontFamily: font, fontSize: 13, fontWeight: 600, color: C.text, outline: "none", cursor: "pointer" }}
+                >
+                  <option value="">— No choice —</option>
+                  {activities.map(a => (
+                    <option key={a.id} value={a.name}>{a.name}{!a.open[pi] ? " (closed)" : ""}</option>
+                  ))}
+                </select>
+              </div>
+            ))}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
+              <button onClick={() => setEditCamperCtx(null)} style={{ background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "8px 16px", fontFamily: font, fontSize: 13, fontWeight: 700, color: C.muted, cursor: "pointer" }}>Cancel</button>
+              <button onClick={saveEdit} style={{ background: C.sage, border: "none", borderRadius: 8, padding: "8px 16px", fontFamily: font, fontSize: 13, fontWeight: 700, color: "white", cursor: "pointer" }}>Save Schedule</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Move camper modal ── */}
       {movingCamper && (
         <div onClick={e => { if (e.target === e.currentTarget) setMovingCamper(null); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -639,7 +764,7 @@ export default function LeadershipDashboard() {
             <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>Move to group</div>
             <select value={moveTarget} onChange={e => setMoveTarget(Number(e.target.value))} style={{ width: "100%", background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", fontFamily: font, fontSize: 13, fontWeight: 600, color: C.text, outline: "none", marginBottom: 16, cursor: "pointer" }}>
               {groups.map((g, i) => i !== movingCamper.gi && (
-                <option key={g.id} value={i}>Group {g.name}{g.counselor ? ` (${g.counselor})` : ""}</option>
+                <option key={g.id} value={i}>{g.name}{g.counselor ? ` (${g.counselor})` : ""}</option>
               ))}
             </select>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>

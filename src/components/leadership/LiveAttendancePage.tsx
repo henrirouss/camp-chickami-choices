@@ -174,15 +174,16 @@ function AccountForModal({
 // ── Activity Card ─────────────────────────────────────────────────────────────
 
 function ActivityCard({
-  stats, period, isExpanded, onToggle, onLocate, onPickup, cardRef,
+  stats, period, isExpanded, onToggle, onLocate, onPickup, onEditSchedule, cardRef,
 }: {
-  stats:      ActivityStats;
-  period:     1 | 2 | 3;
-  isExpanded: boolean;
-  onToggle:   () => void;
-  onLocate:   (camper: Camper) => void;
-  onPickup:   (camper: Camper) => void;
-  cardRef:    (el: HTMLDivElement | null) => void;
+  stats:           ActivityStats;
+  period:          1 | 2 | 3;
+  isExpanded:      boolean;
+  onToggle:        () => void;
+  onLocate:        (camper: Camper) => void;
+  onPickup:        (camper: Camper) => void;
+  onEditSchedule:  (camper: Camper) => void;
+  cardRef:         (el: HTMLDivElement | null) => void;
 }) {
   const { activity, expected, checkedIn, elsewhere, pickup, missing, unexpected, cardStatus } = stats;
 
@@ -269,6 +270,7 @@ function ActivityCard({
                 </div>
                 {type === "missing" && (
                   <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                    <MiniBtn label="Edit" color={C.sage} onClick={() => onEditSchedule(camper)} />
                     <MiniBtn label="Locate" color={C.yellow} onClick={() => onLocate(camper)} />
                     <MiniBtn label="Pickup" color={C.purple} onClick={() => onPickup(camper)} />
                   </div>
@@ -354,6 +356,8 @@ export default function LiveAttendancePage() {
   const [rightTab,      setRightTab]      = useState<"feed" | "changes" | "unaccounted">("feed");
   const [showAll,          setShowAll]          = useState(false);
   const [locateCtx,        setLocateCtx]        = useState<LocateCtx | null>(null);
+  const [editCamper,       setEditCamper]       = useState<Camper | null>(null);
+  const [editChoices,      setEditChoices]      = useState<[string, string, string]>(["", "", ""]);
   const [dismissed,        setDismissed]        = useState<Set<string>>(new Set());
   const [searchQuery,      setSearchQuery]      = useState("");
   const [searchFocused,    setSearchFocused]    = useState(false);
@@ -677,6 +681,26 @@ export default function LiveAttendancePage() {
     await refreshAndSync();
   }
 
+  function openEditCamper(camper: Camper) {
+    setEditCamper(camper);
+    setEditChoices([camper.choiceP1, camper.choiceP2, camper.choiceP3]);
+  }
+
+  async function saveEditCamper() {
+    if (!editCamper) return;
+    const [p1, p2, p3] = editChoices;
+    setCampers(prev => prev.map(c => c.id !== editCamper.id ? c : {
+      ...c, choiceP1: p1, choiceP2: p2, choiceP3: p3,
+    }));
+    await supabase.from("campers").update({
+      choice_p1: p1 || null,
+      choice_p2: p2 || null,
+      choice_p3: p3 || null,
+    }).eq("id", editCamper.id);
+    setEditCamper(null);
+    refreshAndSync();
+  }
+
   function openLocate(camperOrCtx: Camper | LocateCtx) {
     if ("expectedActivityId" in camperOrCtx) {
       setLocateCtx(camperOrCtx);
@@ -823,6 +847,7 @@ export default function LiveAttendancePage() {
                 onToggle={() => setExpandedAct(prev => prev === s.activity.id ? null : s.activity.id)}
                 onLocate={openLocate}
                 onPickup={directPickup}
+                onEditSchedule={openEditCamper}
                 cardRef={el => {
                   if (el) cardRefs.current.set(s.activity.id, el);
                   else cardRefs.current.delete(s.activity.id);
@@ -895,6 +920,7 @@ export default function LiveAttendancePage() {
                 choiceKey={choiceKey}
                 onLocate={openLocate}
                 onPickup={directPickup}
+                onEditSchedule={openEditCamper}
               />
             )}
           </div>
@@ -909,6 +935,48 @@ export default function LiveAttendancePage() {
           onConfirm={handleLocateConfirm}
           onClose={() => setLocateCtx(null)}
         />
+      )}
+
+      {/* ── Edit schedule modal ── */}
+      {editCamper && (
+        <div
+          onClick={e => { if (e.target === e.currentTarget) setEditCamper(null); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 500, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
+        >
+          <div style={{ background: C.white, borderRadius: 16, width: 420, boxShadow: "0 24px 64px rgba(0,0,0,0.22)", fontFamily: font }}>
+            <div style={{ padding: "22px 24px 0" }}>
+              <div style={{ fontSize: 16, fontWeight: 900, color: C.text, marginBottom: 2 }}>Edit Schedule</div>
+              <div style={{ fontSize: 13, color: C.muted, fontWeight: 500, marginBottom: 20 }}>
+                {editCamper.lastName}, {editCamper.firstName} · Group {editCamper.groupName}
+              </div>
+              {(["Period 1", "Period 2", "Period 3"] as const).map((label, pi) => (
+                <div key={pi} style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, marginBottom: 6 }}>{label}</div>
+                  <select
+                    value={editChoices[pi]}
+                    onChange={e => { const v = e.target.value; setEditChoices(prev => prev.map((c, i) => i === pi ? v : c) as [string, string, string]); }}
+                    style={{ width: "100%", background: C.grey, border: `1.5px solid ${C.greyBd}`, borderRadius: 8, padding: "10px 12px", fontFamily: font, fontSize: 13, fontWeight: 600, color: C.text, outline: "none", cursor: "pointer" }}
+                  >
+                    <option value="">— No choice —</option>
+                    {activities.map(a => (
+                      <option key={a.id} value={a.name}>{a.name}</option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div style={{ padding: "12px 24px 22px", display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={() => setEditCamper(null)}
+                style={{ border: "none", borderRadius: 8, padding: "10px 20px", fontFamily: font, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.grey, color: C.greyTx }}>
+                Cancel
+              </button>
+              <button onClick={saveEditCamper}
+                style={{ border: "none", borderRadius: 8, padding: "10px 24px", fontFamily: font, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.sageDk, color: "white" }}>
+                Save Schedule
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -972,13 +1040,14 @@ function FeedTab({
 // ── Unaccounted tab ───────────────────────────────────────────────────────────
 
 function UnaccountedTab({
-  campers, activities, choiceKey, onLocate, onPickup,
+  campers, activities, choiceKey, onLocate, onPickup, onEditSchedule,
 }: {
-  campers:    Camper[];
-  activities: Activity[];
-  choiceKey:  "choiceP1" | "choiceP2" | "choiceP3";
-  onLocate:   (camper: Camper) => void;
-  onPickup:   (camper: Camper) => void;
+  campers:         Camper[];
+  activities:      Activity[];
+  choiceKey:       "choiceP1" | "choiceP2" | "choiceP3";
+  onLocate:        (camper: Camper) => void;
+  onPickup:        (camper: Camper) => void;
+  onEditSchedule:  (camper: Camper) => void;
 }) {
   if (campers.length === 0) {
     return (
@@ -1008,6 +1077,7 @@ function UnaccountedTab({
               </div>
             </div>
             <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+              <MiniBtn label="Edit" color={C.sage} onClick={() => onEditSchedule(camper)} />
               <MiniBtn label="Locate" color={C.yellow}  onClick={() => onLocate(camper)} />
               <MiniBtn label="Pickup" color={C.purple}  onClick={() => onPickup(camper)} />
             </div>

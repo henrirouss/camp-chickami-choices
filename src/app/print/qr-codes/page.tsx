@@ -3,6 +3,7 @@
 import { QRCodeSVG } from "qrcode.react";
 import { useState, useEffect } from "react";
 import LeadershipNav from "@/components/LeadershipNav";
+import { createClient } from "@/lib/supabase/client";
 
 const C = {
   bg:     "#F4F6F3", white:  "#FFFFFF",
@@ -11,12 +12,17 @@ const C = {
 };
 const font = "var(--font-figtree), Figtree, sans-serif";
 
-const GROUPS = ["A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P"];
-
 export default function QRCodesPage() {
   const [origin, setOrigin] = useState("");
+  const [groups, setGroups] = useState<string[]>([]);
 
-  useEffect(() => { setOrigin(window.location.origin); }, []);
+  useEffect(() => {
+    setOrigin(window.location.origin);
+    const supabase = createClient();
+    supabase.from("groups").select("name").order("name").then(({ data }) => {
+      if (data) setGroups(data.map((g: { name: string }) => g.name));
+    });
+  }, []);
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, fontFamily: font }}>
@@ -59,8 +65,8 @@ export default function QRCodesPage() {
         gridTemplateColumns: "repeat(4, 1fr)",
         gap: 20,
       }}>
-        {GROUPS.map(group => {
-          const url = origin ? `${origin}/counselor/${group}` : "";
+        {groups.map(group => {
+          const url = origin ? `${origin}/counselor/${encodeURIComponent(group)}` : "";
           return (
             <div
               key={group}
@@ -100,7 +106,7 @@ export default function QRCodesPage() {
                   fontSize: 22, fontWeight: 900, color: C.sageDk,
                   letterSpacing: "-0.3px", lineHeight: 1,
                 }}>
-                  Group {group}
+                  {group}
                 </div>
                 <div style={{
                   fontSize: 10, fontWeight: 600, color: C.muted,

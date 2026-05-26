@@ -44,7 +44,12 @@ type ActivityRow = {
   open_p1: boolean;
   open_p2: boolean;
   open_p3: boolean;
+  capacity_p1: number | null;
+  capacity_p2: number | null;
+  capacity_p3: number | null;
 };
+
+type SignupCounts = Record<string, [number, number, number]>;
 
 type CamperState = {
   id: string;
@@ -108,6 +113,7 @@ export default function CounselorPage({ group }: { group: string }) {
   const [nameInput, setNameInput]         = useState("");
   const [showSchedule, setShowSchedule]   = useState(false);
   const [submitted, setSubmitted]         = useState(false);
+  const [signupCounts, setSignupCounts]   = useState<SignupCounts>({});
   const [animateKey, setAnimateKey]       = useState(0);
   const nameInputRef = useRef<HTMLInputElement>(null);
 
@@ -151,12 +157,15 @@ export default function CounselorPage({ group }: { group: string }) {
           absent: c.absent,
         })));
 
-        // 3. Load activities
+        // 3. Load activities (including capacity caps)
         const { data: acts, error: actsErr } = await supabase
           .from("activities")
-          .select("id, name, abbreviation, open_p1, open_p2, open_p3");
+          .select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3");
         if (actsErr) throw actsErr;
         setActivities(acts ?? []);
+
+        // 4b. Load signup counts across all groups for capacity enforcement
+        await refreshCounts();
 
         // 4. Load schedule image URL from settings
         const { data: settings } = await supabase
@@ -224,6 +233,33 @@ export default function CounselorPage({ group }: { group: string }) {
     setShowNameOverlay(true);
   }
 
+  // ── Signup counts (real-time capacity enforcement) ────────────────────────
+
+  async function refreshCounts() {
+    const { data } = await supabase
+      .from("campers")
+      .select("choice_p1, choice_p2, choice_p3")
+      .eq("absent", false);
+    if (!data) return;
+    const counts: SignupCounts = {};
+    for (const row of data as { choice_p1: string | null; choice_p2: string | null; choice_p3: string | null }[]) {
+      [row.choice_p1, row.choice_p2, row.choice_p3].forEach((act, pi) => {
+        if (act) {
+          if (!counts[act]) counts[act] = [0, 0, 0];
+          counts[act][pi]++;
+        }
+      });
+    }
+    setSignupCounts(counts);
+  }
+
+  // Poll counts every 10 s so this group sees other groups' selections
+  useEffect(() => {
+    const t = setInterval(refreshCounts, 10_000);
+    return () => clearInterval(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── Camper actions ────────────────────────────────────────────────────────
 
   const d = camperData[camperIdx];
@@ -256,19 +292,40 @@ export default function CounselorPage({ group }: { group: string }) {
     }
   }
 
+  function bumpCounts(oldAct: string | null, newAct: string | null, slot: number) {
+    setSignupCounts(prev => {
+      const next = { ...prev };
+      if (oldAct) {
+        const c = next[oldAct] ? ([...next[oldAct]] as [number, number, number]) : [0, 0, 0] as [number, number, number];
+        c[slot] = Math.max(0, c[slot] - 1);
+        next[oldAct] = c;
+      }
+      if (newAct) {
+        const c = next[newAct] ? ([...next[newAct]] as [number, number, number]) : [0, 0, 0] as [number, number, number];
+        c[slot] = c[slot] + 1;
+        next[newAct] = c;
+      }
+      return next;
+    });
+  }
+
   function selectActivity(actName: string) {
     if (!d || d.absent) return;
     const slot = editingSlot ?? ci;
     if (slot < 0 || slot >= 3) return;
+    const oldAct = d.choices[slot] || null;
     patchCamper(camperIdx, {
       choices: d.choices.map((v, j) => j === slot ? actName : v) as Choices,
     });
+    bumpCounts(oldAct, actName, slot);
     if (editingSlot !== null) setEditingSlot(null);
   }
 
   function clearSlot(i: number) {
     if (!d) return;
+    const oldAct = d.choices[i] || null;
     patchCamper(camperIdx, { choices: d.choices.map((v, j) => j === i ? "" : v) as Choices });
+    if (oldAct) bumpCounts(oldAct, null, i);
   }
 
   function editSlot(i: number) {
@@ -318,14 +375,24 @@ export default function CounselorPage({ group }: { group: string }) {
     }).catch(() => {});
   }
 
-  // Whether an activity is closed for the slot currently being filled
+  // Slot-state helpers for the currently active period
+  function activeSlot(): number { return editingSlot ?? ci; }
+
   function isClosedForActiveSlot(act: ActivityRow): boolean {
     if (!d || d.absent) return false;
-    const slot = editingSlot ?? ci;
+    const slot = activeSlot();
     if (slot === 0) return !act.open_p1;
     if (slot === 1) return !act.open_p2;
     if (slot === 2) return !act.open_p3;
     return false;
+  }
+
+  function isFullForActiveSlot(act: ActivityRow): boolean {
+    const slot = activeSlot();
+    if (slot < 0 || slot >= 3) return false;
+    const cap = [act.capacity_p1, act.capacity_p2, act.capacity_p3][slot];
+    if (cap === null || cap === undefined) return false;
+    return (signupCounts[act.name]?.[slot] ?? 0) >= cap;
   }
 
   // ── Loading / error ───────────────────────────────────────────────────────
@@ -356,7 +423,7 @@ export default function CounselorPage({ group }: { group: string }) {
         <div style={{ fontSize: 56, marginBottom: 14 }}>🌿</div>
         <div style={{ fontSize: 26, fontWeight: 900, marginBottom: 8 }}>Submitted!</div>
         <div style={{ fontSize: 14, color: C.muted, fontWeight: 600, lineHeight: 1.7 }}>
-          Group {group}&apos;s choices are in.<br />Leadership has been notified.
+          {group}&apos;s choices are in.<br />Leadership has been notified.
         </div>
       </div>
     );
@@ -366,7 +433,7 @@ export default function CounselorPage({ group }: { group: string }) {
     return (
       <div style={{ height: "100dvh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: C.cream, fontFamily: font, textAlign: "center", padding: "40px 28px" }}>
         <div style={{ fontSize: 40, marginBottom: 16 }}>👤</div>
-        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8, color: C.text }}>No campers in Group {group}</div>
+        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8, color: C.text }}>No campers in {group}</div>
         <div style={{ fontSize: 13, color: C.muted }}>Add campers in the Leadership settings.</div>
       </div>
     );
@@ -383,7 +450,7 @@ export default function CounselorPage({ group }: { group: string }) {
           <div style={{ fontSize: 48, marginBottom: 16 }}>👋</div>
           <div style={{ fontSize: 22, fontWeight: 900, letterSpacing: "-0.3px", marginBottom: 6 }}>What&apos;s your name?</div>
           <div style={{ fontSize: 13, fontWeight: 500, color: C.muted, marginBottom: 24, lineHeight: 1.5 }}>
-            This will be saved as today&apos;s counselor<br />for Group {group}
+            This will be saved as today&apos;s counselor<br />for {group}
           </div>
           <input
             ref={nameInputRef}
@@ -422,7 +489,7 @@ export default function CounselorPage({ group }: { group: string }) {
       <div style={{ background: C.white, borderBottom: `1.5px solid ${C.border}`, padding: "10px 14px 8px", flexShrink: 0, display: "flex", alignItems: "center", gap: 10 }}>
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
           <div style={{ fontSize: 13, fontWeight: 800 }}>
-            Group {group}&nbsp;·&nbsp;{counselorName || "—"}
+            {group}&nbsp;·&nbsp;{counselorName || "—"}
             <button onClick={openNamePrompt} title="Edit name" style={{ background: "none", border: "none", fontSize: 11, cursor: "pointer", color: C.muted, padding: "2px 4px", borderRadius: 4, fontFamily: font, fontWeight: 600, display: "inline-flex", alignItems: "center", verticalAlign: "middle", marginLeft: 4 }}>✏</button>
           </div>
           <div style={{ display: "flex", gap: 3 }}>
@@ -461,10 +528,13 @@ export default function CounselorPage({ group }: { group: string }) {
             style={{ flex: 1, padding: "6px 12px", display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: `repeat(${Math.ceil(activities.length / 3)}, 1fr)`, gap: 7, overflow: "hidden", animation: "fadeUp 0.18s ease" }}
           >
             {activities.map((act, idx) => {
-              const selPeriods  = d.choices.map((v, pi) => v === act.name ? pi : -1).filter(pi => pi !== -1);
-              const closedSlot  = isClosedForActiveSlot(act);
-              const isDisabled  = d.absent || (closedSlot && selPeriods.length === 0);
-              const lastTwo     = activities.length % 3 === 2;
+              const selPeriods = d.choices.map((v, pi) => v === act.name ? pi : -1).filter(pi => pi !== -1);
+              const slot       = activeSlot();
+              const closedSlot = isClosedForActiveSlot(act);
+              const isFull     = !d.absent && isFullForActiveSlot(act);
+              const alreadyInSlot = selPeriods.includes(slot);
+              const isDisabled = d.absent || (closedSlot && selPeriods.length === 0) || (isFull && !alreadyInSlot);
+              const lastTwo    = activities.length % 3 === 2;
               const gridStyle: React.CSSProperties = {};
               if (lastTwo && idx === activities.length - 2) gridStyle.gridColumn = 1;
               if (lastTwo && idx === activities.length - 1) gridStyle.gridColumn = 2;
@@ -478,7 +548,7 @@ export default function CounselorPage({ group }: { group: string }) {
                     border: "2px solid", borderRadius: 12,
                     fontFamily: font, fontSize: 13, fontWeight: 700,
                     cursor: isDisabled ? "default" : "pointer",
-                    opacity: isDisabled ? 0.35 : 1,
+                    opacity: isDisabled ? (isFull && !closedSlot ? 0.55 : 0.35) : 1,
                     display: "flex", flexDirection: "column",
                     alignItems: "center", justifyContent: "center",
                     textAlign: "center", padding: "4px 6px", lineHeight: 1.2,
@@ -492,6 +562,9 @@ export default function CounselorPage({ group }: { group: string }) {
                     <span style={{ fontSize: 9, fontWeight: 900, opacity: 0.7, display: "block", marginTop: 2 }}>
                       {selPeriods.map(i => ["P1", "P2", "P3"][i]).join(" ")}
                     </span>
+                  )}
+                  {isFull && !alreadyInSlot && (
+                    <span style={{ fontSize: 8, fontWeight: 900, background: "rgba(0,0,0,0.08)", color: "inherit", padding: "1px 5px", borderRadius: 99, display: "block", marginTop: 2 }}>Full</span>
                   )}
                 </button>
               );
