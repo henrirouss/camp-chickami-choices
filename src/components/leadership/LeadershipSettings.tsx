@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect, useRef, useMemo } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { createClient } from "@/lib/supabase/client";
+import { loadActiveSession, type ActiveSession } from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -79,6 +81,30 @@ export default function LeadershipSettings() {
   const [syncing,        setSyncing]       = useState(false);
   const [syncLog,        setSyncLog]       = useState<string[]>([]);
   const [connectedBanner,setConnectedBanner] = useState(false);
+  const [qrGroups,       setQrGroups]        = useState<{ id: string; name: string }[]>([]);
+  const [qrOrigin,       setQrOrigin]        = useState("");
+
+  // ── Custom Activities ──────────────────────────────────────────────────────
+  const [customActs,     setCustomActs]      = useState<{ id: string; name: string; abbreviation: string }[]>([]);
+  const [newActName,     setNewActName]      = useState("");
+  const [newActAbbrev,   setNewActAbbrev]    = useState("");
+  const [addingAct,      setAddingAct]       = useState(false);
+
+  // ── Session Mode ───────────────────────────────────────────────────────────
+  const [activeSession,     setActiveSession]     = useState<ActiveSession | null>(null);
+  const [sessionBuilding,   setSessionBuilding]   = useState(false);
+  const [buildName,         setBuildName]         = useState("");
+  const [buildDate,         setBuildDate]         = useState(new Date().toISOString().split("T")[0]);
+  const [buildPeriodCount,  setBuildPeriodCount]  = useState(3);
+  const [buildPeriods,      setBuildPeriods]      = useState([
+    { label: "Period 1", time: "1:00–1:45 PM" },
+    { label: "Period 2", time: "1:50–2:35 PM" },
+    { label: "Period 3", time: "2:40–3:25 PM" },
+  ]);
+  const [buildActivities, setBuildActivities] = useState<{ name: string; abbreviation: string }[]>([]);
+  const [activating,    setActivating]    = useState(false);
+  const [deactivating,  setDeactivating]  = useState(false);
+  const [confirmDeact,  setConfirmDeact]  = useState(false);
 
   const schedRef = useRef<HTMLInputElement>(null);
   const csvRef   = useRef<HTMLInputElement>(null);
@@ -106,6 +132,38 @@ export default function LeadershipSettings() {
       setTimeout(() => setConnectedBanner(false), 4000);
     }
   }, []);
+
+  // ── Load QR groups ────────────────────────────────────────────────────────
+  useEffect(() => {
+    setQrOrigin(window.location.origin);
+    supabase.from("groups").select("id, name").order("name").then(({ data }) => {
+      if (data) setQrGroups(data as { id: string; name: string }[]);
+    });
+  }, [supabase]);
+
+  // ── Load custom activities + active session ───────────────────────────────
+  useEffect(() => {
+    supabase
+      .from("activities")
+      .select("id, name, abbreviation")
+      .eq("is_custom", true)
+      .is("session_id", null)
+      .eq("is_active", true)
+      .order("name")
+      .then(({ data }) => {
+        if (data) setCustomActs(data as { id: string; name: string; abbreviation: string }[]);
+      });
+    loadActiveSession(supabase).then(sess => setActiveSession(sess));
+  }, [supabase]);
+
+  // ── Resize period builder rows when period count changes ──────────────────
+  useEffect(() => {
+    setBuildPeriods(prev => {
+      const next = [...prev];
+      while (next.length < buildPeriodCount) next.push({ label: "", time: "" });
+      return next.slice(0, buildPeriodCount);
+    });
+  }, [buildPeriodCount]);
 
   // ── Save helper ───────────────────────────────────────────────────────────
   function save(updates: Partial<Settings>) {
@@ -139,6 +197,113 @@ export default function LeadershipSettings() {
     await fetch("/api/google/disconnect", { method: "POST" });
     setS(prev => prev ? { ...prev, google_email: null } : prev);
     setSyncLog([]);
+  }
+
+  // ── Custom activity helpers ───────────────────────────────────────────────
+  async function addCustomActivity() {
+    const name   = newActName.trim();
+    const abbrev = newActAbbrev.trim();
+    if (!name || !abbrev) return;
+    setAddingAct(true);
+    const { data, error } = await supabase
+      .from("activities")
+      .insert({ name, abbreviation: abbrev, is_custom: true, is_active: true, open_p1: true, open_p2: true, open_p3: true })
+      .select("id, name, abbreviation")
+      .single();
+    setAddingAct(false);
+    if (error) { alert("Could not add activity: " + error.message); return; }
+    setCustomActs(prev => [...prev, data as { id: string; name: string; abbreviation: string }].sort((a, b) => a.name.localeCompare(b.name)));
+    setNewActName(""); setNewActAbbrev("");
+  }
+
+  async function deleteCustomActivity(actId: string, actName: string) {
+    const { count } = await supabase
+      .from("campers")
+      .select("id", { count: "exact", head: true })
+      .or(`choice_p1.eq.${actName},choice_p2.eq.${actName},choice_p3.eq.${actName},choice_p4.eq.${actName},choice_p5.eq.${actName}`);
+    if (count && count > 0) {
+      alert(`Cannot delete "${actName}" — ${count} camper${count !== 1 ? "s are" : " is"} currently signed up.`);
+      return;
+    }
+    await supabase.from("activities").delete().eq("id", actId);
+    setCustomActs(prev => prev.filter(a => a.id !== actId));
+  }
+
+  // ── Session helpers ───────────────────────────────────────────────────────
+  async function clearAllData() {
+    await supabase.from("campers").delete().not("id", "is", null);
+    await supabase.from("groups").delete().not("id", "is", null);
+  }
+
+  async function activateSession() {
+    if (!buildName.trim()) { alert("Session name is required."); return; }
+    setActivating(true);
+    try {
+      const periodsJson = buildPeriods.slice(0, buildPeriodCount).map((p, i) => {
+        const parts = p.time.split("–").map(t => t.trim());
+        return {
+          label:      p.label.trim() || `Period ${i + 1}`,
+          start_time: parts[0] ?? "",
+          end_time:   parts[1] ?? "",
+        };
+      });
+      const activitiesJson = buildActivities
+        .filter(a => a.name.trim())
+        .map(a => ({
+          name:         a.name.trim(),
+          abbreviation: a.abbreviation.trim() || a.name.trim().slice(0, 4),
+          capacity_p1: null, capacity_p2: null, capacity_p3: null,
+        }));
+
+      const { data: sess, error: sessErr } = await supabase
+        .from("sessions")
+        .insert({
+          name: buildName.trim(), date: buildDate,
+          period_count: buildPeriodCount,
+          periods: periodsJson, activities: activitiesJson,
+          is_active: true,
+        })
+        .select("id, name, date, period_count, periods, activities")
+        .single();
+      if (sessErr || !sess) throw sessErr ?? new Error("Failed to create session");
+
+      const sessId = (sess as { id: string }).id;
+
+      await supabase.from("sessions").update({ is_active: false }).neq("id", sessId);
+
+      if (activitiesJson.length > 0) {
+        await supabase.from("activities").insert(
+          activitiesJson.map(a => ({
+            name: a.name, abbreviation: a.abbreviation,
+            is_custom: true, is_active: true, session_id: sessId,
+            open_p1: true, open_p2: true, open_p3: true,
+          }))
+        );
+      }
+
+      await clearAllData();
+      setActiveSession(sess as ActiveSession);
+      setSessionBuilding(false);
+    } catch (e) {
+      alert("Activation failed: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setActivating(false);
+    }
+  }
+
+  async function deactivateSession() {
+    if (!activeSession) return;
+    setDeactivating(true);
+    try {
+      await supabase.from("activities").delete().eq("session_id", activeSession.id);
+      await supabase.from("sessions").update({ is_active: false }).eq("id", activeSession.id);
+      await clearAllData();
+      setActiveSession(null);
+      setConfirmDeact(false);
+      setSessionBuilding(false);
+    } finally {
+      setDeactivating(false);
+    }
   }
 
   // ── Shared input/select styles ────────────────────────────────────────────
@@ -258,7 +423,8 @@ export default function LeadershipSettings() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div style={{ flex: 1, overflowY: "auto", background: C.bg, fontFamily: font, color: C.text }}>
+    <>
+    <div className="settings-page" style={{ flex: 1, overflowY: "auto", background: C.bg, fontFamily: font, color: C.text }}>
       <div style={{ maxWidth: 820, margin: "0 auto", padding: "28px 32px 56px" }}>
 
         {/* Connected banner */}
@@ -499,6 +665,196 @@ export default function LeadershipSettings() {
           </div>
         </Card>
 
+        {/* ── Custom Activities ── */}
+        <Card title="Custom Activities" desc="Add permanent activities beyond the default 14. They appear in the Activity Manager, counselor signup, and print sheets.">
+          {customActs.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              {customActs.map(act => (
+                <div key={act.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
+                  <div style={{ flex: 1 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{act.name}</span>
+                    <span style={{ fontSize: 11, color: C.muted, fontWeight: 600, marginLeft: 8 }}>{act.abbreviation}</span>
+                    <span style={{ fontSize: 10, fontWeight: 800, background: C.sageLt, color: C.sageDk, padding: "1px 6px", borderRadius: 99, marginLeft: 6 }}>Custom</span>
+                  </div>
+                  <button
+                    onClick={() => deleteCustomActivity(act.id, act.name)}
+                    style={{ background: C.redLt, border: `1px solid #FCA5A5`, borderRadius: 6, padding: "4px 10px", fontFamily: font, fontSize: 11, fontWeight: 700, color: C.red, cursor: "pointer" }}>
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {customActs.length === 0 && (
+            <div style={{ fontSize: 12, color: C.muted, fontWeight: 500, marginBottom: 16 }}>No custom activities yet.</div>
+          )}
+          <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+            <div style={{ flex: 2 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 4 }}>Name</div>
+              <input
+                value={newActName}
+                onChange={e => setNewActName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && !addingAct && addCustomActivity()}
+                placeholder="e.g. Drama"
+                style={{ ...inp, width: "100%" }}
+                onFocus={e => (e.target.style.borderColor = C.sage)}
+                onBlur={e => (e.target.style.borderColor = C.border)}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 4 }}>Abbrev.</div>
+              <input
+                value={newActAbbrev}
+                onChange={e => setNewActAbbrev(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && !addingAct && addCustomActivity()}
+                placeholder="Dr"
+                style={{ ...inp, width: "100%" }}
+                onFocus={e => (e.target.style.borderColor = C.sage)}
+                onBlur={e => (e.target.style.borderColor = C.border)}
+              />
+            </div>
+            <button
+              onClick={addCustomActivity}
+              disabled={addingAct || !newActName.trim() || !newActAbbrev.trim()}
+              style={{ background: C.sageDk, border: "none", borderRadius: 8, padding: "9px 16px", fontFamily: font, fontSize: 12, fontWeight: 700, color: "white", cursor: "pointer", opacity: (!newActName.trim() || !newActAbbrev.trim()) ? 0.4 : 1, flexShrink: 0 }}>
+              {addingAct ? "Adding…" : "Add"}
+            </button>
+          </div>
+        </Card>
+
+        {/* ── Session Mode ── */}
+        <Card title="Session Mode" desc="Run a custom session (e.g. OST, Orientation) with its own periods and activities. Activating clears all current groups and campers.">
+
+          {/* Active session banner */}
+          {activeSession && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, background: C.greenLt, border: `1.5px solid #86EFAC`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#22C55E", flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "#15803D" }}>Session Active: {activeSession.name}</div>
+                <div style={{ fontSize: 11, fontWeight: 500, color: "#166534", marginTop: 1 }}>
+                  {activeSession.date} · {activeSession.period_count} period{activeSession.period_count !== 1 ? "s" : ""} · {(activeSession.activities as {name:string}[]).length} activities
+                </div>
+              </div>
+              <button
+                onClick={() => setConfirmDeact(true)}
+                style={{ background: C.redLt, border: `1.5px solid #FCA5A5`, borderRadius: 8, padding: "7px 14px", fontFamily: font, fontSize: 12, fontWeight: 700, color: C.red, cursor: "pointer", flexShrink: 0 }}>
+                Deactivate
+              </button>
+            </div>
+          )}
+
+          {/* No active session, builder hidden */}
+          {!activeSession && !sessionBuilding && (
+            <button
+              onClick={() => setSessionBuilding(true)}
+              style={{ background: C.sageDk, border: "none", borderRadius: 8, padding: "9px 20px", fontFamily: font, fontSize: 13, fontWeight: 700, color: "white", cursor: "pointer" }}>
+              Create Custom Session
+            </button>
+          )}
+
+          {/* Session builder */}
+          {!activeSession && sessionBuilding && (
+            <div>
+              {/* Name + Date */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 4 }}>Session Name</div>
+                  <input value={buildName} onChange={e => setBuildName(e.target.value)} placeholder="e.g. OST Test" style={{ ...inp, width: "100%" }} onFocus={e => (e.target.style.borderColor = C.sage)} onBlur={e => (e.target.style.borderColor = C.border)} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 4 }}>Date</div>
+                  <input type="date" value={buildDate} onChange={e => setBuildDate(e.target.value)} style={{ ...inp, width: "100%" }} onFocus={e => (e.target.style.borderColor = C.sage)} onBlur={e => (e.target.style.borderColor = C.border)} />
+                </div>
+              </div>
+
+              {/* Period count */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 6 }}>Number of Periods</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {[1,2,3,4,5].map(n => (
+                    <button key={n} onClick={() => setBuildPeriodCount(n)} style={{ width: 38, height: 38, borderRadius: 8, border: `1.5px solid ${buildPeriodCount === n ? C.sageDk : C.border}`, background: buildPeriodCount === n ? C.sageDk : C.white, color: buildPeriodCount === n ? "white" : C.text, fontFamily: font, fontSize: 13, fontWeight: 800, cursor: "pointer" }}>{n}</button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Period rows */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 6 }}>Periods</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {buildPeriods.map((p, i) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <input
+                        value={p.label}
+                        onChange={e => setBuildPeriods(prev => prev.map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                        placeholder={`Period ${i + 1} label`}
+                        style={{ ...inp, width: "100%" }}
+                        onFocus={e => (e.target.style.borderColor = C.sage)}
+                        onBlur={e => (e.target.style.borderColor = C.border)}
+                      />
+                      <input
+                        value={p.time}
+                        onChange={e => setBuildPeriods(prev => prev.map((x, j) => j === i ? { ...x, time: e.target.value } : x))}
+                        placeholder="3:00–4:00 PM"
+                        style={{ ...inp, width: "100%" }}
+                        onFocus={e => (e.target.style.borderColor = C.sage)}
+                        onBlur={e => (e.target.style.borderColor = C.border)}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Activity builder */}
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 6 }}>Session Activities <span style={{ fontWeight: 500 }}>(session-only, not saved permanently)</span></div>
+                {buildActivities.map((a, i) => (
+                  <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
+                    <input value={a.name} onChange={e => setBuildActivities(prev => prev.map((x, j) => j === i ? { ...x, name: e.target.value } : x))} placeholder="Activity name" style={{ ...inp, flex: 2 }} onFocus={e => (e.target.style.borderColor = C.sage)} onBlur={e => (e.target.style.borderColor = C.border)} />
+                    <input value={a.abbreviation} onChange={e => setBuildActivities(prev => prev.map((x, j) => j === i ? { ...x, abbreviation: e.target.value } : x))} placeholder="Abbrev" style={{ ...inp, flex: 1 }} onFocus={e => (e.target.style.borderColor = C.sage)} onBlur={e => (e.target.style.borderColor = C.border)} />
+                    <button onClick={() => setBuildActivities(prev => prev.filter((_, j) => j !== i))} style={{ background: C.redLt, border: `1px solid #FCA5A5`, borderRadius: 6, padding: "4px 8px", fontFamily: font, fontSize: 11, fontWeight: 700, color: C.red, cursor: "pointer", flexShrink: 0 }}>✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setBuildActivities(prev => [...prev, { name: "", abbreviation: "" }])} style={{ background: C.white, border: `1.5px dashed ${C.border}`, borderRadius: 8, padding: "7px 14px", fontFamily: font, fontSize: 12, fontWeight: 700, color: C.muted, cursor: "pointer", marginTop: 4 }}>+ Add Activity</button>
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setSessionBuilding(false)} style={{ background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "9px 18px", fontFamily: font, fontSize: 13, fontWeight: 700, color: C.muted, cursor: "pointer" }}>Cancel</button>
+                <button
+                  onClick={activateSession}
+                  disabled={activating || !buildName.trim()}
+                  style={{ background: C.sageDk, border: "none", borderRadius: 8, padding: "9px 20px", fontFamily: font, fontSize: 13, fontWeight: 700, color: "white", cursor: "pointer", opacity: !buildName.trim() ? 0.4 : 1 }}>
+                  {activating ? "Activating…" : "Activate Session"}
+                </button>
+              </div>
+            </div>
+          )}
+        </Card>
+
+        {/* ── QR Codes ── */}
+        <Card title="QR Codes" desc="Print and cut out — one per group folder. Counselors scan to open their group's signup page.">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginBottom: 16 }}>
+            {qrGroups.map(g => {
+              const url = qrOrigin ? `${qrOrigin}/counselor/${encodeURIComponent(g.name)}` : "";
+              return (
+                <div key={g.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                  <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 8, padding: 8 }}>
+                    {url
+                      ? <QRCodeSVG value={url} size={110} bgColor={C.white} fgColor={C.text} level="M" includeMargin={false} />
+                      : <div style={{ width: 110, height: 110, background: C.bg, borderRadius: 4 }} />}
+                  </div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: C.sageDk, textAlign: "center" }}>{g.name}</div>
+                </div>
+              );
+            })}
+          </div>
+          <button
+            onClick={() => window.print()}
+            style={{ background: C.sageDk, border: "none", borderRadius: 8, padding: "9px 20px", fontFamily: font, fontSize: 13, fontWeight: 700, color: "white", cursor: "pointer" }}>
+            Print QR Codes
+          </button>
+        </Card>
+
         {/* ── Danger Zone ── */}
         <Card title="Danger Zone" danger>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -527,6 +883,24 @@ export default function LeadershipSettings() {
 
       </div>
 
+      {/* ── Deactivate session confirm ── */}
+      {confirmDeact && (
+        <div onClick={e => { if (e.target === e.currentTarget) setConfirmDeact(false); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ background: C.white, borderRadius: 16, width: 420, padding: 28, boxShadow: "0 20px 60px rgba(0,0,0,0.2)", fontFamily: font }}>
+            <div style={{ fontSize: 17, fontWeight: 800, marginBottom: 10, color: C.text }}>Deactivate Session?</div>
+            <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, margin: "0 0 24px" }}>
+              This will end the current session, remove all session activities, and clear all groups and campers. The default Camp Chickami setup will be restored. This cannot be undone.
+            </p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setConfirmDeact(false)} style={{ background: C.bg, border: `1.5px solid ${C.border}`, borderRadius: 8, padding: "9px 18px", fontFamily: font, fontSize: 13, fontWeight: 700, color: C.muted, cursor: "pointer" }}>Cancel</button>
+              <button onClick={deactivateSession} disabled={deactivating} style={{ background: C.red, border: "none", borderRadius: 8, padding: "9px 18px", fontFamily: font, fontSize: 13, fontWeight: 700, color: "white", cursor: "pointer", opacity: deactivating ? 0.6 : 1 }}>
+                {deactivating ? "Deactivating…" : "Yes, Deactivate"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Confirm modal ── */}
       {confirm && (
         <div
@@ -538,7 +912,7 @@ export default function LeadershipSettings() {
             </div>
             <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, margin: "0 0 24px" }}>
               {confirm === "submissions"
-                ? "This will reset submitted=false for all 16 groups and clear every camper's activity choices. The roster is preserved. This cannot be undone."
+                ? "This will reset submitted=false for all groups and clear every camper's activity choices. The roster is preserved. This cannot be undone."
                 : "This will permanently delete every camper from every group. Groups themselves will remain intact. This cannot be undone."}
             </p>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
@@ -555,5 +929,30 @@ export default function LeadershipSettings() {
         </div>
       )}
     </div>
+
+    {/* Print-only QR page — hidden in browser, shown when printing */}
+    <div className="qr-print-section" style={{ display: "none" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 20, padding: 24 }}>
+        {qrGroups.map(g => {
+          const url = qrOrigin ? `${qrOrigin}/counselor/${encodeURIComponent(g.name)}` : "";
+          return (
+            <div key={g.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: 16, border: "1px solid #ccc", borderRadius: 8 }}>
+              {url && <QRCodeSVG value={url} size={130} bgColor="#FFFFFF" fgColor="#1A2318" level="M" includeMargin={false} />}
+              <div style={{ fontSize: 16, fontWeight: 900, textAlign: "center" }}>{g.name}</div>
+              <div style={{ fontSize: 9, color: "#888", wordBreak: "break-all", textAlign: "center" }}>{url.replace(/^https?:\/\//, "")}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+
+    <style>{`
+      @media print {
+        .settings-page { display: none !important; }
+        .qr-print-section { display: block !important; }
+        nav { display: none !important; }
+      }
+    `}</style>
+    </>
   );
 }

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { loadActiveSession, getPeriodLabel, getPeriodCount, type ActiveSession } from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -18,17 +19,17 @@ const font = "var(--font-figtree), Figtree, sans-serif";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Choices  = [string, string, string];
+type Choices  = string[];
 type Camper   = { id: string; firstName: string; lastName: string; choices: Choices; absent: boolean };
 type Group    = { id: string; name: string; counselor: string; submitted: boolean; campers: Camper[] };
-type Activity = { id: string; name: string; abbreviation: string; open: [boolean, boolean, boolean]; capacity: [number | null, number | null, number | null] };
+type Activity = { id: string; name: string; abbreviation: string; open: [boolean, boolean, boolean]; capacity: [number | null, number | null, number | null]; is_custom?: boolean };
 type Tab      = "grid" | "activities" | "roster" | "upload";
 
 // ── DB row types ──────────────────────────────────────────────────────────────
 
 type DBGroup    = { id: string; name: string; counselor_name: string | null; submitted: boolean };
-type DBCamper   = { id: string; first_name: string; last_name: string; group_id: string; absent: boolean; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null };
-type DBActivity = { id: string; name: string; abbreviation: string; open_p1: boolean; open_p2: boolean; open_p3: boolean; capacity_p1: number | null; capacity_p2: number | null; capacity_p3: number | null };
+type DBCamper   = { id: string; first_name: string; last_name: string; group_id: string; absent: boolean; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null; choice_p4: string | null; choice_p5: string | null };
+type DBActivity = { id: string; name: string; abbreviation: string; open_p1: boolean; open_p2: boolean; open_p3: boolean; capacity_p1: number | null; capacity_p2: number | null; capacity_p3: number | null; is_custom?: boolean };
 
 // ── Converters ────────────────────────────────────────────────────────────────
 
@@ -38,7 +39,10 @@ function toUiCamper(c: DBCamper): Camper {
     firstName: c.first_name,
     lastName:  c.last_name,
     absent:    c.absent,
-    choices:   [c.choice_p1 ?? "", c.choice_p2 ?? "", c.choice_p3 ?? ""],
+    choices:   [
+      c.choice_p1 ?? "", c.choice_p2 ?? "", c.choice_p3 ?? "",
+      c.choice_p4 ?? "", c.choice_p5 ?? "",
+    ],
   };
 }
 
@@ -71,11 +75,12 @@ export default function LeadershipDashboard() {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [tab,        setTab]        = useState<Tab>("grid");
+  const [session,    setSession]    = useState<ActiveSession | null>(null);
   const [movingCamper, setMovingCamper] = useState<{ gi: number; ci: number } | null>(null);
   const [moveTarget, setMoveTarget] = useState(0);
   const [alertDismissed, setAlertDismissed] = useState(false);
   const [editCamperCtx, setEditCamperCtx] = useState<{ id: string; firstName: string; lastName: string; groupName: string } | null>(null);
-  const [editChoices, setEditChoices] = useState<Choices>(["", "", ""]);
+  const [editChoices, setEditChoices] = useState<Choices>(["", "", "", "", ""]);
   const [schedFileName, setSchedFileName]   = useState<string | null>(null);
   const settingsId = useRef<string | null>(null);
   const csvRef   = useRef<HTMLInputElement>(null);
@@ -83,11 +88,12 @@ export default function LeadershipDashboard() {
 
   // ── Load all data ─────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
-    const [gRes, cRes, aRes, sRes] = await Promise.all([
+    const [gRes, cRes, aRes, sRes, sess] = await Promise.all([
       supabase.from("groups").select("id, name, counselor_name, submitted").order("name"),
-      supabase.from("campers").select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3"),
-      supabase.from("activities").select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3").order("name"),
+      supabase.from("campers").select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3, choice_p4, choice_p5"),
+      supabase.from("activities").select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3, is_custom").eq("is_active", true).order("name"),
       supabase.from("settings").select("id").limit(1).maybeSingle(),
+      loadActiveSession(supabase),
     ]);
 
     if (gRes.data && cRes.data) {
@@ -98,11 +104,13 @@ export default function LeadershipDashboard() {
         id: a.id, name: a.name, abbreviation: a.abbreviation,
         open: [a.open_p1, a.open_p2, a.open_p3],
         capacity: [a.capacity_p1, a.capacity_p2, a.capacity_p3],
+        is_custom: a.is_custom ?? false,
       })));
     }
     if (sRes.data) {
       settingsId.current = (sRes.data as { id: string }).id;
     }
+    setSession(sess);
     setLoading(false);
   }, [supabase]);
 
@@ -183,12 +191,12 @@ export default function LeadershipDashboard() {
 
   // ── Derived: signup counts per activity per period ────────────────────────
   const signupCounts = useMemo(() => {
-    const counts: Record<string, [number, number, number]> = {};
+    const counts: Record<string, number[]> = {};
     groups.forEach(g => g.campers.forEach(c =>
       c.choices.forEach((act, pi) => {
         if (act) {
-          if (!counts[act]) counts[act] = [0, 0, 0];
-          counts[act][pi]++;
+          if (!counts[act]) counts[act] = [0, 0, 0, 0, 0];
+          counts[act][pi] = (counts[act][pi] ?? 0) + 1;
         }
       })
     ));
@@ -240,7 +248,9 @@ export default function LeadershipDashboard() {
 
   function openEdit(c: Camper, g: Group) {
     setEditCamperCtx({ id: c.id, firstName: c.firstName, lastName: c.lastName, groupName: g.name });
-    setEditChoices([...c.choices] as Choices);
+    const base = [...c.choices];
+    while (base.length < 5) base.push("");
+    setEditChoices(base as Choices);
   }
 
   async function saveEdit() {
@@ -254,6 +264,8 @@ export default function LeadershipDashboard() {
       choice_p1: editChoices[0] || null,
       choice_p2: editChoices[1] || null,
       choice_p3: editChoices[2] || null,
+      choice_p4: editChoices[3] || null,
+      choice_p5: editChoices[4] || null,
     }).eq("id", id);
     setEditCamperCtx(null);
   }
@@ -343,6 +355,10 @@ export default function LeadershipDashboard() {
     }));
     return n;
   })();
+
+  // ── Session-derived period info ───────────────────────────────────────────
+  const periodCount  = getPeriodCount(session);
+  const periodLabels = Array.from({ length: periodCount }, (_, i) => getPeriodLabel(session, i));
 
   // ── Tab styles ────────────────────────────────────────────────────────────
   const tabBtn = (id: Tab): React.CSSProperties => ({
@@ -499,7 +515,7 @@ export default function LeadershipDashboard() {
                               {c.absent
                                 ? <span style={{ fontSize: 9, fontWeight: 700, background: "#F3E8FF", color: "#7E22CE", padding: "1px 5px", borderRadius: 99 }}>Absent</span>
                                 : <span style={{ fontSize: 10, fontWeight: 600, color: C.muted }}>
-                                    {c.choices.map((act, pi) => (
+                                    {c.choices.slice(0, periodCount).map((act, pi) => (
                                       <span key={pi} style={{ color: isConflict(act, pi) ? C.red : undefined, fontWeight: isConflict(act, pi) ? 700 : undefined }}>
                                         {pi > 0 ? " · " : ""}{act ? abbrOf(act) : "—"}
                                       </span>
@@ -526,28 +542,32 @@ export default function LeadershipDashboard() {
                   <div style={{ fontSize: 12, fontWeight: 500, color: C.muted, marginTop: 1 }}>Toggle activities open or closed per period · Conflicts flagged automatically</div>
                 </div>
                 <div style={{ background: C.white, border: `1.5px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 120px 120px 120px", background: C.bg, borderBottom: `1.5px solid ${C.border}`, padding: "10px 16px" }}>
-                    {["Activity", "Period 1", "Period 2", "Period 3", "Shortcuts"].map((h, i) => (
+                  <div style={{ display: "grid", gridTemplateColumns: `1fr ${Array(Math.min(periodCount, 3)).fill("120px").join(" ")} 120px`, background: C.bg, borderBottom: `1.5px solid ${C.border}`, padding: "10px 16px" }}>
+                    {["Activity", ...periodLabels.slice(0, Math.min(periodCount, 3)), "Shortcuts"].map((h, i) => (
                       <div key={h} style={{ textAlign: i === 0 ? "left" : "center" }}>
                         <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted }}>{h}</div>
-                        {i > 0 && i < 4 && <div style={{ fontSize: 8, fontWeight: 600, color: C.muted, marginTop: 1, letterSpacing: "0.04em" }}>on/off · max</div>}
+                        {i > 0 && i < Math.min(periodCount, 3) + 1 && <div style={{ fontSize: 8, fontWeight: 600, color: C.muted, marginTop: 1, letterSpacing: "0.04em" }}>on/off · max</div>}
                       </div>
                     ))}
                   </div>
                   {activities.map((act, ai) => {
                     const actConflicts = conflicts.filter(c => c.act === act.name);
                     const allOpen      = act.open.every(v => v);
+                    const capCols      = Math.min(periodCount, 3);
                     return (
-                      <div key={act.id} style={{ display: "grid", gridTemplateColumns: "1fr 120px 120px 120px 120px", padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
+                      <div key={act.id} style={{ display: "grid", gridTemplateColumns: `1fr ${Array(capCols).fill("120px").join(" ")} 120px`, padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center", background: actConflicts.length ? "#FFFBEB" : undefined }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: C.text, display: "flex", alignItems: "center", gap: 6 }}>
                           {act.name}
+                          {act.is_custom && (
+                            <span style={{ fontSize: 9, fontWeight: 800, background: C.sageLt, color: C.sageDk, padding: "1px 5px", borderRadius: 99 }}>Custom</span>
+                          )}
                           {actConflicts.length > 0 && (
                             <span style={{ fontSize: 10, fontWeight: 700, background: C.yellowLt, color: C.yellow, padding: "2px 6px", borderRadius: 99, border: "1px solid #FCD34D" }}>
                               ⚠ {actConflicts.length} conflict{actConflicts.length > 1 ? "s" : ""}
                             </span>
                           )}
                         </div>
-                        {[0, 1, 2].map(pi => (
+                        {Array.from({ length: capCols }, (_, pi) => (
                           <div key={pi} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5 }}>
                             <Toggle on={act.open[pi]} onToggle={() => toggleActivity(ai, pi)} />
                             <input
@@ -732,7 +752,7 @@ export default function LeadershipDashboard() {
           <div style={{ background: C.white, borderRadius: 16, width: 400, padding: 24, boxShadow: "0 20px 60px rgba(0,0,0,0.2)", fontFamily: font }}>
             <div style={{ fontSize: 17, fontWeight: 800, marginBottom: 4 }}>Edit Schedule</div>
             <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>{editCamperCtx.firstName} {editCamperCtx.lastName} · {editCamperCtx.groupName}</div>
-            {(["Period 1", "Period 2", "Period 3"] as const).map((label, pi) => (
+            {periodLabels.map((label, pi) => (
               <div key={pi} style={{ marginBottom: 14 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>{label}</div>
                 <select

@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import LeadershipNav from "@/components/LeadershipNav";
 import { createClient } from "@/lib/supabase/client";
+import { loadActiveSession, getPeriodLabel, getPeriodTime, getPeriodCount, type ActiveSession } from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -14,27 +15,6 @@ const C = {
 };
 const font = "var(--font-figtree), Figtree, sans-serif";
 
-// ── Static reference data ─────────────────────────────────────────────────────
-
-const ABBR: Record<string, string> = {
-  "Field": "F", "Pool": "Pool", "Arts & Crafts": "A/C",
-  "Pav": "Pav", "Gaga": "Gaga", "Front Lawn": "FL",
-  "Building": "B", "Courts": "C", "Chowderhouse": "CH",
-  "Nature": "N", "Archery": "Arch", "Ropes": "R",
-  "Loch Lodge": "LL", "New Games": "NG",
-};
-
-const PERIODS = [
-  { label: "Period 1", time: "1:00–1:45 PM" },
-  { label: "Period 2", time: "1:50–2:35 PM" },
-  { label: "Period 3", time: "2:40–3:25 PM" },
-];
-
-function abbr(name: string | null | undefined) {
-  if (!name) return "—";
-  return ABBR[name] ?? name;
-}
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type SheetCamper = {
@@ -42,14 +22,12 @@ type SheetCamper = {
   firstName:  string;
   lastName:   string;
   groupName:  string;
-  choice_p1:  string | null;
-  choice_p2:  string | null;
-  choice_p3:  string | null;
+  choices:    (string | null)[];   // indices 0–4 (p1–p5)
 };
 
 type Sheet = {
   activityName: string;
-  period:       1 | 2 | 3;
+  period:       number;            // 1-based
   campers:      SheetCamper[];
 };
 
@@ -58,7 +36,9 @@ type Sheet = {
 export default function PrintPage() {
   const supabase = useMemo(() => createClient(), []);
 
+  const [session,       setSession]       = useState<ActiveSession | null>(null);
   const [sheets,        setSheets]        = useState<Sheet[]>([]);
+  const [abbrevMap,     setAbbrevMap]     = useState<Record<string, string>>({});
   const [allActivities, setAllActivities] = useState<string[]>([]);
   const [loading,       setLoading]       = useState(true);
   const [origin,        setOrigin]        = useState("");
@@ -67,55 +47,89 @@ export default function PrintPage() {
     weekday: "long", year: "numeric", month: "long", day: "numeric",
   });
 
+  const periodCount = getPeriodCount(session);
+
+  function abbr(name: string | null | undefined, fallback = "—") {
+    if (!name) return fallback;
+    return abbrevMap[name] ?? name;
+  }
+
   useEffect(() => {
     setOrigin(window.location.origin);
 
     async function load() {
-      // Load submitted groups + activity list in parallel
-      const [{ data: groups }, { data: activities }] = await Promise.all([
+      // 1. Load session and submitted groups in parallel
+      const [sess, { data: groups }] = await Promise.all([
+        loadActiveSession(supabase),
         supabase.from("groups").select("id, name").eq("submitted", true).order("name"),
-        supabase.from("activities").select("name").order("name"),
       ]);
+      setSession(sess);
+      const pc = sess?.period_count ?? 3;
 
-      setAllActivities((activities ?? []).map((a: { name: string }) => a.name));
+      // 2. Load activities (scoped to session if active)
+      let actsQuery = supabase
+        .from("activities")
+        .select("name, abbreviation")
+        .eq("is_active", true)
+        .order("name");
+      if (sess) {
+        actsQuery = actsQuery.eq("session_id", sess.id);
+      } else {
+        actsQuery = actsQuery.is("session_id", null);
+      }
+      const { data: activities } = await actsQuery;
+      const aMap: Record<string, string> = {};
+      for (const a of (activities ?? []) as { name: string; abbreviation: string }[]) {
+        aMap[a.name] = a.abbreviation;
+      }
+      setAbbrevMap(aMap);
+      setAllActivities(Object.keys(aMap));
 
       if (!groups || groups.length === 0) { setLoading(false); return; }
 
       const typedGroups = groups as { id: string; name: string }[];
       const gMap = new Map(typedGroups.map(g => [g.id, g.name]));
 
+      // 3. Load campers (up to 5 choice columns)
       const { data: campers } = await supabase
         .from("campers")
-        .select("id, first_name, last_name, group_id, choice_p1, choice_p2, choice_p3")
+        .select("id, first_name, last_name, group_id, choice_p1, choice_p2, choice_p3, choice_p4, choice_p5")
         .in("group_id", typedGroups.map(g => g.id))
         .eq("absent", false);
 
-      // Build activity → [p1campers, p2campers, p3campers] map
-      const actMap = new Map<string, [SheetCamper[], SheetCamper[], SheetCamper[]]>();
+      // 4. Build activity → per-period camper lists
+      type DBCamper = {
+        id: string; first_name: string; last_name: string; group_id: string;
+        choice_p1: string | null; choice_p2: string | null; choice_p3: string | null;
+        choice_p4: string | null; choice_p5: string | null;
+      };
 
-      type DBCamper = { id: string; first_name: string; last_name: string; group_id: string; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null };
+      const actMap = new Map<string, SheetCamper[][]>();   // actName → [p0[], p1[], …, p(pc-1)[]]
+
       for (const c of (campers as DBCamper[] | null) ?? []) {
+        const allChoices = [c.choice_p1, c.choice_p2, c.choice_p3, c.choice_p4, c.choice_p5];
         const sc: SheetCamper = {
           id: c.id, firstName: c.first_name, lastName: c.last_name,
           groupName: gMap.get(c.group_id) ?? "",
-          choice_p1: c.choice_p1, choice_p2: c.choice_p2, choice_p3: c.choice_p3,
+          choices: allChoices,
         };
-        [c.choice_p1, c.choice_p2, c.choice_p3].forEach((choice, pi) => {
-          if (!choice) return;
-          if (!actMap.has(choice)) actMap.set(choice, [[], [], []]);
+        for (let pi = 0; pi < pc; pi++) {
+          const choice = allChoices[pi];
+          if (!choice) continue;
+          if (!actMap.has(choice)) actMap.set(choice, Array.from({ length: pc }, () => []));
           actMap.get(choice)![pi].push(sc);
-        });
+        }
       }
 
-      // Build sheet list — activities sorted alphabetically, then period 1→2→3
+      // 5. Build sheet list — activities alphabetical, periods 1→pc
       const sheetList: Sheet[] = [];
       for (const actName of [...actMap.keys()].sort()) {
-        const [p1, p2, p3] = actMap.get(actName)!;
-        ([p1, p2, p3] as SheetCamper[][]).forEach((list, pi) => {
+        const periodLists = actMap.get(actName)!;
+        periodLists.forEach((list, pi) => {
           if (list.length > 0) {
             sheetList.push({
               activityName: actName,
-              period: (pi + 1) as 1 | 2 | 3,
+              period: pi + 1,
               campers: [...list].sort((a, b) => a.lastName.localeCompare(b.lastName)),
             });
           }
@@ -184,13 +198,14 @@ export default function PrintPage() {
           sheets.map((sheet, idx) => {
             const isLast   = idx === sheets.length - 1;
             const twoCol   = sheet.campers.length >= 40;
-            const period   = PERIODS[sheet.period - 1];
+            const periodLabel = getPeriodLabel(session, sheet.period - 1);
+            const periodTime  = getPeriodTime(session, sheet.period - 1);
             const qrUrl    = origin ? `${origin}/attendance/${encodeURIComponent(sheet.activityName)}/${sheet.period}` : "";
 
-            // Next-pick column visibility (single-col layout only)
-            // Period 1 sheet → show next P2 pick; Period 2 sheet → show next P3 pick; Period 3 → nothing
-            const showNextP2 = !twoCol && sheet.period === 1;
-            const showNextP3 = !twoCol && sheet.period === 2;
+            // Next-pick column: show if not two-col and not the last period
+            const nextPeriod = sheet.period < periodCount ? sheet.period : null; // next period index (0-based) = sheet.period
+            const showNext   = !twoCol && nextPeriod !== null;
+            const nextLabel  = showNext ? getPeriodLabel(session, nextPeriod!).replace("Period ", "P") : "";
 
             // Two-column split
             const half       = Math.ceil(sheet.campers.length / 2);
@@ -226,8 +241,8 @@ export default function PrintPage() {
                     {sheet.activityName}
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <span style={{ fontSize: 14, fontWeight: 800, color: C.sageDk }}>{period.label}</span>
-                    <span style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{period.time}</span>
+                    <span style={{ fontSize: 14, fontWeight: 800, color: C.sageDk }}>{periodLabel}</span>
+                    <span style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>{periodTime}</span>
                     <span style={{ fontSize: 10, fontWeight: 800, background: C.sageLt, color: C.sageDk, padding: "2px 9px", borderRadius: 99, letterSpacing: "0.04em" }}>
                       {sheet.campers.length} camper{sheet.campers.length !== 1 ? "s" : ""}
                     </span>
@@ -277,8 +292,7 @@ export default function PrintPage() {
                         <th style={{ ...th, width: 28 }}>#</th>
                         <th style={{ ...th }}>Name</th>
                         <th style={{ ...th, width: 52 }}>Group</th>
-                        {showNextP2 && <th style={{ ...th, width: 52, textAlign: "center" }}>→ P2</th>}
-                        {showNextP3 && <th style={{ ...th, width: 52, textAlign: "center" }}>→ P3</th>}
+                        {showNext && <th style={{ ...th, width: 52, textAlign: "center" }}>→ {nextLabel}</th>}
                         <th style={{ ...th, width: 28, textAlign: "center" }}>✓</th>
                       </tr>
                     </thead>
@@ -288,11 +302,10 @@ export default function PrintPage() {
                           <td style={{ ...td, color: C.muted, fontWeight: 600 }}>{i + 1}</td>
                           <td style={{ ...td, fontWeight: 600, color: C.text }}>{c.lastName}, {c.firstName}</td>
                           <td style={{ ...td, color: C.muted, fontWeight: 600 }}>{c.groupName}</td>
-                          {showNextP2 && (
-                            <td style={{ ...td, textAlign: "center", fontWeight: 700, color: C.sageDk }}>{abbr(c.choice_p2)}</td>
-                          )}
-                          {showNextP3 && (
-                            <td style={{ ...td, textAlign: "center", fontWeight: 700, color: C.sageDk }}>{abbr(c.choice_p3)}</td>
+                          {showNext && (
+                            <td style={{ ...td, textAlign: "center", fontWeight: 700, color: C.sageDk }}>
+                              {abbr(c.choices[nextPeriod!] ?? null)}
+                            </td>
                           )}
                           <td style={{ ...td, textAlign: "center" }}>
                             <div style={{ width: 13, height: 13, border: "1.5px solid #9CA3AF", borderRadius: 2, margin: "0 auto" }} />

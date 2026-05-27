@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { loadActiveSession, getPeriodLabel, getPeriodTime, type ActiveSession } from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -24,16 +25,12 @@ const C = {
 
 const font = "var(--font-figtree), Figtree, sans-serif";
 
-const PERIODS = [
-  { label: "Period 1", time: "1:00–1:45 PM" },
-  { label: "Period 2", time: "1:50–2:35 PM" },
-  { label: "Period 3", time: "2:40–3:25 PM" },
-];
-
 const PERIOD_COLORS = [
   { bg: "#E8F5E4", bd: "#9DC894", tx: "#3A6635" },
   { bg: "#FEF4E2", bd: "#F0C06A", tx: "#8A5E10" },
   { bg: "#FCE8E8", bd: "#EAA0A0", tx: "#8A3535" },
+  { bg: "#E0F2FE", bd: "#7DD3FC", tx: "#0369A1" },
+  { bg: "#FDF4FF", bd: "#E879F9", tx: "#86198F" },
 ];
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -82,10 +79,11 @@ export default function AttendancePage({
 }) {
   const supabase   = useMemo(() => createClient(), []);
   const actName    = decodeURIComponent(activitySlug);
-  const periodNum  = Math.max(1, Math.min(3, parseInt(periodStr, 10) || 1));
-  const period     = PERIODS[periodNum - 1];
-  const periodC    = PERIOD_COLORS[periodNum - 1];
-  const choiceCol  = `choice_p${periodNum}` as "choice_p1" | "choice_p2" | "choice_p3";
+  const periodNum  = Math.max(1, Math.min(5, parseInt(periodStr, 10) || 1));
+  const periodC    = PERIOD_COLORS[Math.min(periodNum - 1, PERIOD_COLORS.length - 1)];
+  const choiceCol  = `choice_p${periodNum}` as "choice_p1" | "choice_p2" | "choice_p3" | "choice_p4" | "choice_p5";
+
+  const [session, setSession] = useState<ActiveSession | null>(null);
 
   const [loading,          setLoading]          = useState(true);
   const [activity,         setActivity]         = useState<Activity | null>(null);
@@ -106,6 +104,10 @@ export default function AttendancePage({
   // ── Load ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     async function load() {
+      // 0. Load active session for period label/time display
+      const sess = await loadActiveSession(supabase);
+      setSession(sess);
+
       // 1. Resolve activity by name
       const { data: act } = await supabase
         .from("activities")
@@ -342,9 +344,9 @@ export default function AttendancePage({
               background: periodC.bg, color: periodC.tx, border: `1px solid ${periodC.bd}`,
               borderRadius: 99, padding: "3px 12px", fontSize: 12, fontWeight: 800,
             }}>
-              {period.label}
+              {getPeriodLabel(session, periodNum - 1)}
             </span>
-            <span style={{ fontSize: 12, opacity: 0.75, fontWeight: 600 }}>{period.time}</span>
+            <span style={{ fontSize: 12, opacity: 0.75, fontWeight: 600 }}>{getPeriodTime(session, periodNum - 1)}</span>
           </div>
 
           {/* Count pills */}

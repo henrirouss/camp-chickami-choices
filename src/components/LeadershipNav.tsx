@@ -19,7 +19,6 @@ const NAV_LINKS = [
   { label: "Morning Signup",   href: "/leadership" },
   { label: "Live Attendance",  href: "/leadership/attendance" },
   { label: "Print Sheets",     href: "/print" },
-  { label: "QR Codes",         href: "/print/qr-codes" },
   { label: "Settings",         href: "/leadership/settings" },
 ];
 

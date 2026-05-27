@@ -2,6 +2,10 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
+import {
+  loadActiveSession, getPeriodLabel, getPeriodTime, getPeriodCount,
+  detectPeriodFromSession, periodEndedFromSession, type ActiveSession,
+} from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -20,18 +24,11 @@ const font = "var(--font-figtree), Figtree, sans-serif";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const PERIODS = [
-  { label: "Period 1", time: "1:00–1:45 PM",  endMins: 825 },
-  { label: "Period 2", time: "1:50–2:35 PM",  endMins: 875 },
-  { label: "Period 3", time: "2:40–3:25 PM",  endMins: 925 },
-];
 const EXTRA_LOCS = ["Nurse", "With Brass"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function nowMins() { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); }
-function detectPeriod(): 1 | 2 | 3 { const m = nowMins(); return m >= 880 ? 3 : m >= 830 ? 2 : 1; }
-function periodEnded(p: 1 | 2 | 3) { return nowMins() > PERIODS[p - 1].endMins; }
 function fmtTime(iso: string | null) {
   if (!iso) return "";
   return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
@@ -39,8 +36,13 @@ function fmtTime(iso: string | null) {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+type ChoiceKey = "choiceP1" | "choiceP2" | "choiceP3" | "choiceP4" | "choiceP5";
 type Activity  = { id: string; name: string; abbreviation: string };
-type Camper    = { id: string; firstName: string; lastName: string; groupName: string; choiceP1: string; choiceP2: string; choiceP3: string };
+type Camper    = {
+  id: string; firstName: string; lastName: string; groupName: string;
+  choiceP1: string; choiceP2: string; choiceP3: string;
+  choiceP4: string; choiceP5: string;
+};
 type AttRec    = { id: string; camperId: string; activityId: string; period: number; status: string; location: string | null; loggedBy: string | null; loggedAt: string | null };
 type LocateCtx = { camper: Camper; expectedActivityId: string | null };
 
@@ -70,7 +72,12 @@ type FeedEvent = {
 // ── DB row types ──────────────────────────────────────────────────────────────
 
 type DBActivity = { id: string; name: string; abbreviation: string };
-type DBCamper   = { id: string; first_name: string; last_name: string; group_id: string; absent: boolean; choice_p1: string | null; choice_p2: string | null; choice_p3: string | null; groups: { name: string } | null };
+type DBCamper   = {
+  id: string; first_name: string; last_name: string; group_id: string; absent: boolean;
+  choice_p1: string | null; choice_p2: string | null; choice_p3: string | null;
+  choice_p4: string | null; choice_p5: string | null;
+  groups: { name: string } | null;
+};
 type DBAttRec   = { id: string; camper_id: string; activity_id: string; period: number; status: string; location: string | null; logged_by: string | null; logged_at: string | null };
 
 // ── Account-For Modal ─────────────────────────────────────────────────────────
@@ -111,7 +118,6 @@ function AccountForModal({
             {ctx.camper.lastName}, {ctx.camper.firstName} · Group {ctx.camper.groupName}
           </div>
 
-          {/* Activity buttons */}
           <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, marginBottom: 10 }}>
             Activity Location
           </div>
@@ -127,7 +133,6 @@ function AccountForModal({
             })}
           </div>
 
-          {/* Extra locations */}
           <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, marginBottom: 10 }}>
             Other Location
           </div>
@@ -143,7 +148,6 @@ function AccountForModal({
             })}
           </div>
 
-          {/* Pickup */}
           <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 16, marginBottom: 20 }}>
             <button
               onClick={() => { setPickup(p => !p); setSelected(null); }}
@@ -174,10 +178,10 @@ function AccountForModal({
 // ── Activity Card ─────────────────────────────────────────────────────────────
 
 function ActivityCard({
-  stats, period, isExpanded, onToggle, onLocate, onPickup, onEditSchedule, cardRef,
+  stats, periodLabel, isExpanded, onToggle, onLocate, onPickup, onEditSchedule, cardRef,
 }: {
   stats:           ActivityStats;
-  period:          1 | 2 | 3;
+  periodLabel:     string;
   isExpanded:      boolean;
   onToggle:        () => void;
   onLocate:        (camper: Camper) => void;
@@ -205,7 +209,6 @@ function ActivityCard({
         transition: "border-color 0.15s, box-shadow 0.15s",
       }}
     >
-      {/* Card header */}
       <button
         onClick={onToggle}
         style={{
@@ -234,10 +237,8 @@ function ActivityCard({
         )}
       </button>
 
-      {/* Expanded camper list */}
       {isExpanded && expected.length > 0 && (
         <div style={{ borderTop: `1px solid ${C.border}` }}>
-          {/* Expected campers */}
           {[
             ...checkedIn.map(c  => ({ camper: c, type: "checkin"  as const, detail: "" })),
             ...elsewhere.map(e  => ({ camper: e.camper, type: "elsewhere" as const, detail: e.location })),
@@ -275,20 +276,13 @@ function ActivityCard({
                     <MiniBtn label="Pickup" color={C.purple} onClick={() => onPickup(camper)} />
                   </div>
                 )}
-                {type === "checkin" && (
-                  <span style={{ fontSize: 10, fontWeight: 800, color: C.greenDk }}>✓</span>
-                )}
-                {type === "elsewhere" && (
-                  <span style={{ fontSize: 10, fontWeight: 700, color: C.greyTx }}>→</span>
-                )}
-                {type === "pickup" && (
-                  <span style={{ fontSize: 10, fontWeight: 800, color: C.purple }}>↑</span>
-                )}
+                {type === "checkin"   && <span style={{ fontSize: 10, fontWeight: 800, color: C.greenDk }}>✓</span>}
+                {type === "elsewhere" && <span style={{ fontSize: 10, fontWeight: 700, color: C.greyTx }}>→</span>}
+                {type === "pickup"    && <span style={{ fontSize: 10, fontWeight: 800, color: C.purple }}>↑</span>}
               </div>
             );
           })}
 
-          {/* Unexpected arrivals */}
           {unexpected.map((camper, i) => (
             <div key={`unexp-${camper.id}`} style={{
               display: "flex", alignItems: "center", gap: 8, padding: "8px 14px",
@@ -308,10 +302,9 @@ function ActivityCard({
         </div>
       )}
 
-      {/* Empty period for this activity */}
       {isExpanded && expected.length === 0 && (
         <div style={{ padding: "12px 14px", borderTop: `1px solid ${C.border}`, fontSize: 12, color: C.muted, fontWeight: 500 }}>
-          No campers signed up for {PERIODS[period - 1].label}
+          No campers signed up for {periodLabel}
         </div>
       )}
     </div>
@@ -346,29 +339,38 @@ function MiniBtn({ label, color, onClick }: { label: string; color: string; onCl
 export default function LiveAttendancePage() {
   const supabase = useMemo(() => createClient(), []);
 
+  const [session,      setSession]      = useState<ActiveSession | null>(null);
   const [activities,   setActivities]   = useState<Activity[]>([]);
   const [campers,      setCampers]      = useState<Camper[]>([]);
   const [attendance,   setAttendance]   = useState<AttRec[]>([]);
   const [loading,      setLoading]      = useState(true);
 
-  const [period,        setPeriod]        = useState<1 | 2 | 3>(() => detectPeriod());
-  const [expandedAct,   setExpandedAct]   = useState<string | null>(null);
-  const [rightTab,      setRightTab]      = useState<"feed" | "changes" | "unaccounted">("feed");
-  const [showAll,          setShowAll]          = useState(false);
-  const [locateCtx,        setLocateCtx]        = useState<LocateCtx | null>(null);
-  const [editCamper,       setEditCamper]       = useState<Camper | null>(null);
-  const [editChoices,      setEditChoices]      = useState<[string, string, string]>(["", "", ""]);
-  const [dismissed,        setDismissed]        = useState<Set<string>>(new Set());
-  const [searchQuery,      setSearchQuery]      = useState("");
-  const [searchFocused,    setSearchFocused]    = useState(false);
-  const [periodManuallySet,setPeriodManuallySet] = useState(false);
+  const [period,            setPeriod]            = useState<number>(1);
+  const [expandedAct,       setExpandedAct]       = useState<string | null>(null);
+  const [rightTab,          setRightTab]          = useState<"feed" | "changes" | "unaccounted">("feed");
+  const [showAll,           setShowAll]           = useState(false);
+  const [locateCtx,         setLocateCtx]         = useState<LocateCtx | null>(null);
+  const [editCamper,        setEditCamper]        = useState<Camper | null>(null);
+  const [editChoices,       setEditChoices]       = useState<string[]>(["", "", "", "", ""]);
+  const [dismissed,         setDismissed]         = useState<Set<string>>(new Set());
+  const [searchQuery,       setSearchQuery]       = useState("");
+  const [searchFocused,     setSearchFocused]     = useState(false);
+  const [periodManuallySet, setPeriodManuallySet] = useState(false);
+
   const searchRef  = useRef<HTMLInputElement>(null);
   const cardRefs   = useRef<Map<string, HTMLDivElement>>(new Map());
-  // Stable refs so callbacks don't re-create on every camper/activity state change
   const campersRef    = useRef<Camper[]>([]);
   const activitiesRef = useRef<Activity[]>([]);
+  const sessionRef    = useRef<ActiveSession | null>(null);
   useEffect(() => { campersRef.current    = campers;    }, [campers]);
   useEffect(() => { activitiesRef.current = activities; }, [activities]);
+  useEffect(() => { sessionRef.current    = session;    }, [session]);
+
+  const periodCount = getPeriodCount(session);
+  const periodLabels = useMemo(
+    () => Array.from({ length: periodCount }, (_, i) => getPeriodLabel(session, i)),
+    [session, periodCount]
+  );
 
   // ── Load helpers ──────────────────────────────────────────────────────────
   const mapAttRec = (r: DBAttRec): AttRec => ({
@@ -386,33 +388,29 @@ export default function LiveAttendancePage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supabase]);
 
-  // Write missing flags for ended periods; auto-clear when camper is now accounted for
   const syncMissingFlags = useCallback(async (freshAtt: AttRec[]) => {
-    const cs = campersRef.current;
+    const cs  = campersRef.current;
     const as_ = activitiesRef.current;
+    const sess = sessionRef.current;
     if (!cs.length || !as_.length) return;
 
+    const pc = getPeriodCount(sess);
     let didWrite = false;
 
-    for (let p = 1; p <= 3; p++) {
-      const pNum = p as 1 | 2 | 3;
-      if (!periodEnded(pNum)) continue;
+    for (let p = 1; p <= pc; p++) {
+      if (!periodEndedFromSession(sess, p, nowMins())) continue;
 
-      const pKey  = `choiceP${p}` as "choiceP1" | "choiceP2" | "choiceP3";
-      const pAtt  = freshAtt.filter(r => r.period === p);
-      // Campers with a real (non-missing) record
+      const pKey = `choiceP${p}` as ChoiceKey;
+      const pAtt = freshAtt.filter(r => r.period === p);
       const realIds    = new Set(pAtt.filter(r => r.status !== "missing").map(r => r.camperId));
-      // Existing missing records: camperId → recordId
       const missingRec = new Map(pAtt.filter(r => r.status === "missing").map(r => [r.camperId, r.id]));
 
-      // 1. Auto-clear missing records for campers who are now accounted for
       const toClear = [...missingRec.entries()].filter(([cid]) => realIds.has(cid));
       for (const [, recId] of toClear) {
         await supabase.from("attendance").delete().eq("id", recId);
         didWrite = true;
       }
 
-      // 2. Insert missing flags for newly missing campers
       const expected = cs.filter(c => c[pKey]);
       const toFlag   = expected.filter(c => !realIds.has(c.id) && !missingRec.has(c.id));
       if (toFlag.length > 0) {
@@ -439,7 +437,6 @@ export default function LiveAttendancePage() {
     const freshAtt = await fetchAttendance();
     setAttendance(freshAtt);
     const wrote = await syncMissingFlags(freshAtt);
-    // Re-fetch only when missing flags were written/cleared so new records appear
     if (wrote) {
       const updatedAtt = await fetchAttendance();
       setAttendance(updatedAtt);
@@ -448,12 +445,31 @@ export default function LiveAttendancePage() {
 
   useEffect(() => {
     async function init() {
+      // Load session first so we can scope activities
+      const sess = await loadActiveSession(supabase);
+      setSession(sess);
+      sessionRef.current = sess;
+
+      // Load activities scoped to session (or default)
+      let actsQuery = supabase
+        .from("activities")
+        .select("id, name, abbreviation")
+        .eq("is_active", true)
+        .order("name");
+      if (sess) {
+        actsQuery = actsQuery.eq("session_id", sess.id);
+      } else {
+        actsQuery = actsQuery.is("session_id", null);
+      }
+
       const [aRes, cRes] = await Promise.all([
-        supabase.from("activities").select("id, name, abbreviation").order("name"),
-        supabase.from("campers")
-          .select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3, groups(name)")
+        actsQuery,
+        supabase
+          .from("campers")
+          .select("id, first_name, last_name, group_id, absent, choice_p1, choice_p2, choice_p3, choice_p4, choice_p5, groups(name)")
           .eq("absent", false).order("last_name"),
       ]);
+
       if (aRes.data) {
         setActivities((aRes.data as DBActivity[]).map(a => ({ id: a.id, name: a.name, abbreviation: a.abbreviation })));
       }
@@ -462,13 +478,17 @@ export default function LiveAttendancePage() {
           id: c.id, firstName: c.first_name, lastName: c.last_name,
           groupName: c.groups?.name ?? "",
           choiceP1: c.choice_p1 ?? "", choiceP2: c.choice_p2 ?? "", choiceP3: c.choice_p3 ?? "",
+          choiceP4: c.choice_p4 ?? "", choiceP5: c.choice_p5 ?? "",
         })));
       }
+
+      // Set initial period from session times
+      setPeriod(detectPeriodFromSession(sess, nowMins()));
+
       await refreshAndSync();
       setLoading(false);
     }
     init();
-  // refreshAndSync is stable once campers/activities are loaded; init runs once
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supabase]);
 
@@ -481,17 +501,17 @@ export default function LiveAttendancePage() {
   // 1-minute period auto-detection
   useEffect(() => {
     const t = setInterval(() => {
-      if (!periodManuallySet) setPeriod(detectPeriod());
+      if (!periodManuallySet) setPeriod(detectPeriodFromSession(sessionRef.current, nowMins()));
     }, 60_000);
     return () => clearInterval(t);
   }, [periodManuallySet]);
 
   // ── Derived: per-activity stats ───────────────────────────────────────────
   const actMap    = useMemo(() => new Map(activities.map(a => [a.id, a])),  [activities]);
-  const camperMap = useMemo(() => new Map(campers.map(c => [c.id, c])),      [campers]);
+  const camperMap = useMemo(() => new Map(campers.map(c => [c.id, c])),     [campers]);
 
   const choiceKey = useMemo(
-    () => `choiceP${period}` as "choiceP1" | "choiceP2" | "choiceP3",
+    () => `choiceP${period}` as ChoiceKey,
     [period]
   );
 
@@ -500,32 +520,37 @@ export default function LiveAttendancePage() {
     [attendance, period]
   );
 
+  const periodEndedNow = useMemo(
+    () => periodEndedFromSession(session, period, nowMins()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [session, period]
+  );
+
   const stats = useMemo<ActivityStats[]>(() => {
-    const ended = periodEnded(period);
     return activities.map(activity => {
       const expected  = campers.filter(c => c[choiceKey] === activity.name);
       const expIdSet  = new Set(expected.map(c => c.id));
       const expRecs   = periodAtt.filter(r => expIdSet.has(r.camperId));
       const hereRecs  = periodAtt.filter(r => r.activityId === activity.id);
 
-      const checkedIn: Camper[]                          = [];
+      const checkedIn: Camper[]                              = [];
       const elsewhere: { camper: Camper; location: string }[] = [];
-      const pickup:    Camper[]                          = [];
+      const pickup:    Camper[]                              = [];
       const doneIds = new Set<string>();
 
       for (const camper of expected) {
-        const recs    = expRecs.filter(r => r.camperId === camper.id);
+        const recs  = expRecs.filter(r => r.camperId === camper.id);
         if (!recs.length) continue;
-        const pRec    = recs.find(r => r.status === "pickup");
+        const pRec  = recs.find(r => r.status === "pickup");
         if (pRec)  { pickup.push(camper);   doneIds.add(camper.id); continue; }
-        const ciRec   = recs.find(r => r.status === "checkedin" && r.activityId === activity.id);
+        const ciRec = recs.find(r => r.status === "checkedin" && r.activityId === activity.id);
         if (ciRec) { checkedIn.push(camper); doneIds.add(camper.id); continue; }
-        const elCi    = recs.find(r => r.status === "checkedin" && r.activityId !== activity.id);
+        const elCi  = recs.find(r => r.status === "checkedin" && r.activityId !== activity.id);
         if (elCi)  {
           elsewhere.push({ camper, location: actMap.get(elCi.activityId)?.name ?? "Elsewhere" });
           doneIds.add(camper.id); continue;
         }
-        const elRec   = recs.find(r => r.status === "elsewhere");
+        const elRec = recs.find(r => r.status === "elsewhere");
         if (elRec) {
           elsewhere.push({ camper, location: elRec.location ?? "Elsewhere" });
           doneIds.add(camper.id); continue;
@@ -538,24 +563,23 @@ export default function LiveAttendancePage() {
         .map(r => camperMap.get(r.camperId))
         .filter(Boolean) as Camper[];
 
-      const accounted   = checkedIn.length + elsewhere.length + pickup.length;
-      const anyAction   = accounted > 0;
-      const allDone     = expected.length > 0 && accounted >= expected.length;
+      const accounted = checkedIn.length + elsewhere.length + pickup.length;
+      const anyAction = accounted > 0;
+      const allDone   = expected.length > 0 && accounted >= expected.length;
 
       let cardStatus: ActivityStats["cardStatus"];
       if (expected.length === 0) cardStatus = "none";
       else if (!anyAction)       cardStatus = "grey";
       else if (allDone)          cardStatus = "complete";
-      else if (ended && missing.length > 0) cardStatus = "alert";
+      else if (periodEndedNow && missing.length > 0) cardStatus = "alert";
       else                       cardStatus = "inprogress";
 
       return { activity, expected, checkedIn, elsewhere, pickup, missing, unexpected, cardStatus };
     });
-  }, [activities, campers, periodAtt, choiceKey, actMap, camperMap, period]);
+  }, [activities, campers, periodAtt, choiceKey, actMap, camperMap, periodEndedNow]);
 
   // ── Derived: unaccounted ──────────────────────────────────────────────────
   const unaccounted = useMemo<Camper[]>(() => {
-    // Exclude "missing" records — those campers are still unaccounted for
     const accountedIds = new Set(
       periodAtt.filter(r => r.status !== "missing").map(r => r.camperId)
     );
@@ -564,7 +588,6 @@ export default function LiveAttendancePage() {
       .sort((a, b) => a.lastName.localeCompare(b.lastName));
   }, [campers, periodAtt, choiceKey]);
 
-  // Auto-snap back to feed when unaccounted hits zero
   useEffect(() => {
     if (rightTab === "unaccounted" && unaccounted.length === 0) setRightTab("feed");
   }, [unaccounted.length, rightTab]);
@@ -577,7 +600,6 @@ export default function LiveAttendancePage() {
       const actName = actMap.get(r.activityId)?.name ?? "Unknown";
       const name    = camper ? `${camper.lastName}, ${camper.firstName}` : "Unknown";
       const group   = camper?.groupName ?? "";
-      // Missing flags come from DB records written by syncMissingFlags
       if (r.status === "missing") {
         if (!dismissed.has(r.id)) {
           events.push({ id: r.id, type: "missing", camperName: name, groupName: group, activityName: actName, detail: "not accounted for", loggedAt: r.loggedAt, period: r.period, dismissible: true });
@@ -605,13 +627,11 @@ export default function LiveAttendancePage() {
     [periodAtt]
   );
 
-  // Changes tab: all non-checkin events across all periods
   const changesEvents = useMemo<FeedEvent[]>(
     () => feedEvents.filter(e => e.type !== "checkin" && e.type !== "missing"),
     [feedEvents]
   );
 
-  // Visible feed (exceptions by default, all if showAll)
   const visibleFeed = useMemo(
     () => showAll ? feedEvents.filter(e => e.type !== "missing" || !dismissed.has(e.id))
                   : feedEvents.filter(e => e.type !== "checkin"),
@@ -651,7 +671,6 @@ export default function LiveAttendancePage() {
     if (!locateCtx) return;
     const { camper, expectedActivityId } = locateCtx;
     const actId = expectedActivityId ?? activities[0]?.id ?? "";
-    // Clear existing records for this camper+period
     const existing = periodAtt.filter(r => r.camperId === camper.id);
     for (const r of existing) {
       await supabase.from("attendance").delete().eq("id", r.id);
@@ -683,19 +702,21 @@ export default function LiveAttendancePage() {
 
   function openEditCamper(camper: Camper) {
     setEditCamper(camper);
-    setEditChoices([camper.choiceP1, camper.choiceP2, camper.choiceP3]);
+    setEditChoices([camper.choiceP1, camper.choiceP2, camper.choiceP3, camper.choiceP4, camper.choiceP5]);
   }
 
   async function saveEditCamper() {
     if (!editCamper) return;
-    const [p1, p2, p3] = editChoices;
+    const [p1, p2, p3, p4, p5] = editChoices;
     setCampers(prev => prev.map(c => c.id !== editCamper.id ? c : {
-      ...c, choiceP1: p1, choiceP2: p2, choiceP3: p3,
+      ...c, choiceP1: p1, choiceP2: p2, choiceP3: p3, choiceP4: p4, choiceP5: p5,
     }));
     await supabase.from("campers").update({
       choice_p1: p1 || null,
       choice_p2: p2 || null,
       choice_p3: p3 || null,
+      choice_p4: p4 || null,
+      choice_p5: p5 || null,
     }).eq("id", editCamper.id);
     setEditCamper(null);
     refreshAndSync();
@@ -731,7 +752,8 @@ export default function LiveAttendancePage() {
     );
   }
 
-  const currentPeriodDetected = detectPeriod();
+  const detectedPeriod = detectPeriodFromSession(session, nowMins());
+  const currentPeriodTime = getPeriodTime(session, period - 1);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -743,25 +765,28 @@ export default function LiveAttendancePage() {
 
         {/* Period switcher */}
         <div style={{ display: "flex", gap: 4, background: "rgba(0,0,0,0.2)", borderRadius: 8, padding: 3 }}>
-          {([1, 2, 3] as const).map(p => (
-            <button key={p} onClick={() => { setPeriod(p); setPeriodManuallySet(true); }} style={{
-              border: "none", borderRadius: 6, padding: "4px 14px", fontFamily: font,
-              fontSize: 12, fontWeight: 800, cursor: "pointer", position: "relative",
-              background: period === p ? C.white : "transparent",
-              color:      period === p ? C.sageDk : "rgba(255,255,255,0.7)",
-              transition: "all 0.15s",
-            }}>
-              P{p}
-              {currentPeriodDetected === p && (
-                <span style={{ position: "absolute", top: 3, right: 3, width: 5, height: 5, borderRadius: "50%", background: C.green, border: "1px solid white" }} />
-              )}
-            </button>
-          ))}
+          {Array.from({ length: periodCount }, (_, i) => {
+            const p = i + 1;
+            const shortLabel = periodLabels[i]?.replace("Period ", "P") ?? `P${p}`;
+            return (
+              <button key={p} onClick={() => { setPeriod(p); setPeriodManuallySet(true); }} style={{
+                border: "none", borderRadius: 6, padding: "4px 14px", fontFamily: font,
+                fontSize: 12, fontWeight: 800, cursor: "pointer", position: "relative",
+                background: period === p ? C.white : "transparent",
+                color:      period === p ? C.sageDk : "rgba(255,255,255,0.7)",
+                transition: "all 0.15s",
+              }}>
+                {shortLabel}
+                {detectedPeriod === p && (
+                  <span style={{ position: "absolute", top: 3, right: 3, width: 5, height: 5, borderRadius: "50%", background: C.green, border: "1px solid white" }} />
+                )}
+              </button>
+            );
+          })}
         </div>
 
-        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", fontWeight: 600 }}>{PERIODS[period - 1].time}</span>
+        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", fontWeight: 600 }}>{currentPeriodTime}</span>
 
-        {/* Spacer */}
         <div style={{ flex: 1 }} />
 
         {/* Search bar */}
@@ -790,7 +815,6 @@ export default function LiveAttendancePage() {
             )}
           </div>
 
-          {/* Search dropdown */}
           {searchHits.length > 0 && (searchFocused || !!searchQuery) && (
             <div style={{
               position: "absolute", top: "calc(100% + 6px)", right: 0,
@@ -842,7 +866,7 @@ export default function LiveAttendancePage() {
               <ActivityCard
                 key={s.activity.id}
                 stats={s}
-                period={period}
+                periodLabel={periodLabels[period - 1] ?? `Period ${period}`}
                 isExpanded={expandedAct === s.activity.id}
                 onToggle={() => setExpandedAct(prev => prev === s.activity.id ? null : s.activity.id)}
                 onLocate={openLocate}
@@ -862,14 +886,13 @@ export default function LiveAttendancePage() {
           width: 360, flexShrink: 0, borderLeft: `1.5px solid ${C.border}`,
           display: "flex", flexDirection: "column", overflow: "hidden", background: C.white,
         }}>
-
-          {/* Panel header */}
           <div style={{ flexShrink: 0, padding: "12px 14px", borderBottom: `1px solid ${C.border}`, background: C.white }}>
-            {/* Check-in counter */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
               <div>
                 <span style={{ fontSize: 22, fontWeight: 900, color: C.text }}>{checkInsCount}</span>
-                <span style={{ fontSize: 12, fontWeight: 600, color: C.muted, marginLeft: 6 }}>check-ins · {PERIODS[period - 1].label}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: C.muted, marginLeft: 6 }}>
+                  check-ins · {periodLabels[period - 1] ?? `Period ${period}`}
+                </span>
               </div>
               {rightTab === "feed" && (
                 <button
@@ -885,7 +908,6 @@ export default function LiveAttendancePage() {
               )}
             </div>
 
-            {/* Tab buttons */}
             <div style={{ display: "flex", gap: 6 }}>
               {(["feed", "changes", "unaccounted"] as const).map(tab => {
                 const label =
@@ -909,7 +931,6 @@ export default function LiveAttendancePage() {
             </div>
           </div>
 
-          {/* Panel content */}
           <div style={{ flex: 1, overflowY: "auto" }}>
             {rightTab === "feed" && <FeedTab events={visibleFeed} onDismiss={id => setDismissed(prev => new Set(prev).add(id))} />}
             {rightTab === "changes" && <FeedTab events={changesEvents} onDismiss={() => {}} />}
@@ -949,12 +970,14 @@ export default function LiveAttendancePage() {
               <div style={{ fontSize: 13, color: C.muted, fontWeight: 500, marginBottom: 20 }}>
                 {editCamper.lastName}, {editCamper.firstName} · Group {editCamper.groupName}
               </div>
-              {(["Period 1", "Period 2", "Period 3"] as const).map((label, pi) => (
+              {Array.from({ length: periodCount }, (_, pi) => (
                 <div key={pi} style={{ marginBottom: 14 }}>
-                  <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, marginBottom: 6 }}>{label}</div>
+                  <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: C.muted, marginBottom: 6 }}>
+                    {periodLabels[pi] ?? `Period ${pi + 1}`}
+                  </div>
                   <select
-                    value={editChoices[pi]}
-                    onChange={e => { const v = e.target.value; setEditChoices(prev => prev.map((c, i) => i === pi ? v : c) as [string, string, string]); }}
+                    value={editChoices[pi] ?? ""}
+                    onChange={e => { const v = e.target.value; setEditChoices(prev => prev.map((c, i) => i === pi ? v : c)); }}
                     style={{ width: "100%", background: C.grey, border: `1.5px solid ${C.greyBd}`, borderRadius: 8, padding: "10px 12px", fontFamily: font, fontSize: 13, fontWeight: 600, color: C.text, outline: "none", cursor: "pointer" }}
                   >
                     <option value="">— No choice —</option>
@@ -1044,7 +1067,7 @@ function UnaccountedTab({
 }: {
   campers:         Camper[];
   activities:      Activity[];
-  choiceKey:       "choiceP1" | "choiceP2" | "choiceP3";
+  choiceKey:       ChoiceKey;
   onLocate:        (camper: Camper) => void;
   onPickup:        (camper: Camper) => void;
   onEditSchedule:  (camper: Camper) => void;
@@ -1061,7 +1084,6 @@ function UnaccountedTab({
     <div>
       {campers.map((camper, i) => {
         const expAct = camper[choiceKey];
-        const actId  = activities.find(a => a.name === expAct)?.id ?? null;
         return (
           <div key={camper.id} style={{
             display: "flex", alignItems: "center", gap: 8, padding: "10px 14px",

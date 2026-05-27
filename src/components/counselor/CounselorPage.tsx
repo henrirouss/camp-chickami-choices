@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { loadActiveSession, getPeriodLabel, getPeriodCount, type ActiveSession } from "@/lib/session";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -20,15 +21,15 @@ const PERIOD_C = [
   { bg: C.p1Bg, bd: C.p1Bd, tx: C.p1Tx },
   { bg: C.p2Bg, bd: C.p2Bd, tx: C.p2Tx },
   { bg: C.p3Bg, bd: C.p3Bd, tx: C.p3Tx },
+  { bg: "#E0F2FE", bd: "#7DD3FC", tx: "#0369A1" },
+  { bg: "#FDF4FF", bd: "#E879F9", tx: "#86198F" },
 ];
-
-const PERIOD_LABELS = ["Period 1", "Period 2", "Period 3"];
 
 const font = "var(--font-figtree), Figtree, sans-serif";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Choices = [string, string, string];
+type Choices = string[];
 
 type GroupRow = {
   id: string;
@@ -101,6 +102,7 @@ export default function CounselorPage({ group }: { group: string }) {
   const [groupRow, setGroupRow]     = useState<GroupRow | null>(null);
   const [activities, setActivities] = useState<ActivityRow[]>([]);
   const [scheduleUrl, setScheduleUrl] = useState<string | null>(null);
+  const [session, setSession]       = useState<ActiveSession | null>(null);
 
   // ── UI state
   const [camperData, setCamperData]       = useState<CamperState[]>([]);
@@ -116,6 +118,13 @@ export default function CounselorPage({ group }: { group: string }) {
   const [signupCounts, setSignupCounts]   = useState<SignupCounts>({});
   const [animateKey, setAnimateKey]       = useState(0);
   const nameInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Session-derived period info ───────────────────────────────────────────
+  const periodCount  = getPeriodCount(session);
+  const periodLabels = useMemo(
+    () => Array.from({ length: periodCount }, (_, i) => getPeriodLabel(session, i)),
+    [session, periodCount]
+  );
 
   // ── Abbreviation map from DB activities
   const abbrevMap = useMemo(
@@ -143,31 +152,45 @@ export default function CounselorPage({ group }: { group: string }) {
 
         if (grp.counselor_name) setCounselorName(grp.counselor_name);
 
-        // 2. Load campers for this group
+        // 2. Load active session
+        const sess = await loadActiveSession(supabase);
+        setSession(sess);
+        const pc = sess?.period_count ?? 3;
+
+        // 3. Load campers for this group
         const { data: campers, error: campErr } = await supabase
           .from("campers")
-          .select("id, first_name, last_name, absent, choice_p1, choice_p2, choice_p3")
+          .select("id, first_name, last_name, absent, choice_p1, choice_p2, choice_p3, choice_p4, choice_p5")
           .eq("group_id", grp.id)
           .order("last_name");
         if (campErr) throw campErr;
         setCamperData((campers ?? []).map(c => ({
           id: c.id,
           displayName: `${c.first_name} ${c.last_name}`,
-          choices: [c.choice_p1 ?? "", c.choice_p2 ?? "", c.choice_p3 ?? ""] as Choices,
+          choices: [
+            c.choice_p1 ?? "", c.choice_p2 ?? "", c.choice_p3 ?? "",
+            c.choice_p4 ?? "", c.choice_p5 ?? "",
+          ].slice(0, pc) as Choices,
           absent: c.absent,
         })));
 
-        // 3. Load activities (including capacity caps)
-        const { data: acts, error: actsErr } = await supabase
+        // 4. Load activities (filter by session if active)
+        let actsQuery = supabase
           .from("activities")
-          .select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3");
+          .select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3")
+          .eq("is_active", true);
+        if (sess) {
+          actsQuery = actsQuery.eq("session_id", sess.id);
+        } else {
+          actsQuery = actsQuery.is("session_id", null);
+        }
+        const { data: acts, error: actsErr } = await actsQuery;
         if (actsErr) throw actsErr;
         setActivities(acts ?? []);
 
-        // 4b. Load signup counts across all groups for capacity enforcement
+        // 5. Load signup counts + schedule image in parallel
         await refreshCounts();
 
-        // 4. Load schedule image URL from settings
         const { data: settings } = await supabase
           .from("settings")
           .select("schedule_image_url")
@@ -175,7 +198,7 @@ export default function CounselorPage({ group }: { group: string }) {
           .maybeSingle();
         setScheduleUrl(settings?.schedule_image_url ?? null);
 
-        // 5. Check daily_log — if no entry for today, show name prompt
+        // 6. Check daily_log — if no entry for today, show name prompt
         const { data: logEntry } = await supabase
           .from("daily_log")
           .select("id")
@@ -267,13 +290,13 @@ export default function CounselorPage({ group }: { group: string }) {
   function currentChoiceIdx(): number {
     if (editingSlot !== null) return editingSlot;
     if (!d || d.absent) return -1;
-    for (let i = 0; i < 3; i++) if (!d.choices[i]) return i;
-    return 3;
+    for (let i = 0; i < periodCount; i++) if (!d.choices[i]) return i;
+    return periodCount;
   }
 
   const ci         = d ? currentChoiceIdx() : -1;
-  const canAdvance = d ? (d.absent || d.choices.every(v => v)) : false;
-  const allDone    = camperData.length > 0 && camperData.every(c => c.absent || c.choices.every(v => v));
+  const canAdvance = d ? (d.absent || d.choices.slice(0, periodCount).every(v => v)) : false;
+  const allDone    = camperData.length > 0 && camperData.every(c => c.absent || c.choices.slice(0, periodCount).every(v => v));
 
   function patchCamper(idx: number, patch: Partial<CamperState>) {
     setCamperData(prev => prev.map((c, i) => i === idx ? { ...c, ...patch } : c));
@@ -286,6 +309,8 @@ export default function CounselorPage({ group }: { group: string }) {
         choice_p1: updated.choices[0] || null,
         choice_p2: updated.choices[1] || null,
         choice_p3: updated.choices[2] || null,
+        choice_p4: updated.choices[3] || null,
+        choice_p5: updated.choices[4] || null,
       }).eq("id", updated.id).then(({ error }) => {
         if (error) console.error("Camper save failed:", error.message);
       });
@@ -312,7 +337,7 @@ export default function CounselorPage({ group }: { group: string }) {
   function selectActivity(actName: string) {
     if (!d || d.absent) return;
     const slot = editingSlot ?? ci;
-    if (slot < 0 || slot >= 3) return;
+    if (slot < 0 || slot >= periodCount) return;
     const oldAct = d.choices[slot] || null;
     patchCamper(camperIdx, {
       choices: d.choices.map((v, j) => j === slot ? actName : v) as Choices,
@@ -337,7 +362,7 @@ export default function CounselorPage({ group }: { group: string }) {
     if (!d) return;
     patchCamper(camperIdx, d.absent
       ? { absent: false }
-      : { absent: true, choices: ["", "", ""] as Choices }
+      : { absent: true, choices: Array.from({ length: periodCount }, () => "") as Choices }
     );
     setEditingSlot(null);
   }
@@ -384,7 +409,7 @@ export default function CounselorPage({ group }: { group: string }) {
     if (slot === 0) return !act.open_p1;
     if (slot === 1) return !act.open_p2;
     if (slot === 2) return !act.open_p3;
-    return false;
+    return false; // periods 4-5: no closed flag, always open
   }
 
   function isFullForActiveSlot(act: ActivityRow): boolean {
@@ -518,7 +543,7 @@ export default function CounselorPage({ group }: { group: string }) {
             <div style={{ fontSize: 22, fontWeight: 900, letterSpacing: "-0.3px", lineHeight: 1, flex: 1 }}>{d.displayName}</div>
             <div style={{ fontSize: 12, fontWeight: 600, color: C.muted }}>{camperIdx + 1} of {camperData.length}</div>
             <div style={{ fontSize: 11, fontWeight: 700, color: d.absent ? C.absTx : C.sageDk, background: d.absent ? C.absBg : C.sageLt, padding: "4px 9px", borderRadius: 20, whiteSpace: "nowrap" }}>
-              {d.absent ? "Marked absent" : ["Tap Period 1", "Tap Period 2", "Tap Period 3", "All done ✓"][Math.min(ci, 3)]}
+              {d.absent ? "Marked absent" : ci < periodCount ? `Tap ${periodLabels[ci]}` : "All done ✓"}
             </div>
           </div>
 
@@ -560,7 +585,7 @@ export default function CounselorPage({ group }: { group: string }) {
                   {act.name}
                   {selPeriods.length > 0 && (
                     <span style={{ fontSize: 9, fontWeight: 900, opacity: 0.7, display: "block", marginTop: 2 }}>
-                      {selPeriods.map(i => ["P1", "P2", "P3"][i]).join(" ")}
+                      {selPeriods.map(i => periodLabels[i]?.replace("Period ", "P") ?? `P${i + 1}`).join(" ")}
                     </span>
                   )}
                   {isFull && !alreadyInSlot && (
@@ -573,17 +598,18 @@ export default function CounselorPage({ group }: { group: string }) {
 
           {/* Scoreboard */}
           <div style={{ background: C.white, borderTop: `1.5px solid ${C.border}`, padding: "8px 12px 0", flexShrink: 0 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 7, marginBottom: 7 }}>
-              {[0, 1, 2].map(i => {
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${periodCount}, 1fr)`, gap: 7, marginBottom: 7 }}>
+              {Array.from({ length: periodCount }, (_, i) => {
                 const val       = d.choices[i];
                 const isEditing = editingSlot === i;
                 const isActive  = !d.absent && editingSlot === null && i === ci && !val;
+                const pc        = PERIOD_C[i] ?? PERIOD_C[PERIOD_C.length - 1];
 
                 let bg = C.sand, border = `1.5px dashed ${C.border}`, txPeriod = C.muted, txVal = C.muted;
                 if (d.absent) {
                   bg = C.absBg; border = `1.5px solid ${C.absBd}`; txPeriod = txVal = C.absTx;
                 } else if (val) {
-                  bg = PERIOD_C[i].bg; border = `1.5px solid ${PERIOD_C[i].bd}`; txPeriod = txVal = PERIOD_C[i].tx;
+                  bg = pc.bg; border = `1.5px solid ${pc.bd}`; txPeriod = txVal = pc.tx;
                 }
                 if (isEditing) border = `1.5px solid ${C.sageDk}`;
                 else if (isActive) border = `1.5px solid ${C.sage}`;
@@ -594,7 +620,7 @@ export default function CounselorPage({ group }: { group: string }) {
                     onClick={() => !d.absent && editSlot(i)}
                     style={{ borderRadius: 10, padding: "7px 9px", border, background: bg, minHeight: 44, display: "flex", flexDirection: "column", justifyContent: "center", transition: "all 0.2s", position: "relative", cursor: d.absent ? "default" : "pointer", boxShadow: isEditing ? "0 0 0 3px rgba(74,110,69,0.25)" : isActive ? "0 0 0 3px rgba(122,158,117,0.15)" : "none", transform: isEditing ? "scale(1.03)" : "none" }}
                   >
-                    <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: "0.09em", textTransform: "uppercase", color: txPeriod, marginBottom: 2 }}>{PERIOD_LABELS[i]}</div>
+                    <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: "0.09em", textTransform: "uppercase", color: txPeriod, marginBottom: 2 }}>{periodLabels[i]}</div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: txVal, lineHeight: 1.2 }}>
                       {d.absent ? "Absent" : val || (isEditing ? "picking…" : "—")}
                     </div>
@@ -637,17 +663,21 @@ export default function CounselorPage({ group }: { group: string }) {
               <div key={cd.id} onClick={() => { setCamperIdx(i); setView("entry"); setEditingSlot(null); }} style={{ background: tileBg, border: `1.5px solid ${tileBd}`, borderRadius: 14, padding: 12, cursor: "pointer" }}>
                 <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 6, color: cd.absent ? C.absTx : C.text }}>{cd.displayName}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                  {[0, 1, 2].map(pi => (
-                    <div key={pi} style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ fontSize: 9, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", width: 20, flexShrink: 0, color: [C.p1Tx, C.p2Tx, C.p3Tx][pi] }}>P{pi + 1}</span>
-                      {cd.absent
-                        ? <span style={{ fontSize: 11, fontWeight: 600, color: C.muted }}>Absent</span>
-                        : cd.choices[pi]
-                        ? <span style={{ fontSize: 11, fontWeight: 700, color: C.text }}>{abbrev(cd.choices[pi])}</span>
-                        : <span style={{ fontSize: 11, fontWeight: 600, color: C.muted }}>—</span>
-                      }
-                    </div>
-                  ))}
+                  {Array.from({ length: periodCount }, (_, pi) => {
+                    const pc = PERIOD_C[pi] ?? PERIOD_C[PERIOD_C.length - 1];
+                    const shortLabel = periodLabels[pi]?.replace("Period ", "P") ?? `P${pi + 1}`;
+                    return (
+                      <div key={pi} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                        <span style={{ fontSize: 9, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", width: 24, flexShrink: 0, color: pc.tx }}>{shortLabel}</span>
+                        {cd.absent
+                          ? <span style={{ fontSize: 11, fontWeight: 600, color: C.muted }}>Absent</span>
+                          : cd.choices[pi]
+                          ? <span style={{ fontSize: 11, fontWeight: 700, color: C.text }}>{abbrev(cd.choices[pi])}</span>
+                          : <span style={{ fontSize: 11, fontWeight: 600, color: C.muted }}>—</span>
+                        }
+                      </div>
+                    );
+                  })}
                 </div>
                 <span style={{ display: "inline-block", marginTop: 6, fontSize: 9, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", padding: "2px 7px", borderRadius: 99, background: badgeBg, color: badgeTx }}>{badgeLabel}</span>
               </div>
