@@ -6,4 +6,7 @@ alter table activities
   add column if not exists capacity_p3 integer;
 
 -- Allow leadership to update activities (toggle open/closed, set capacity)
-create policy if not exists "activities_update" on activities for update using (true);
+do $$ begin
+  create policy "activities_update" on activities for update using (true);
+exception when duplicate_object then null;
+end $$;
