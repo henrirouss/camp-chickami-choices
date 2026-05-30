@@ -93,7 +93,7 @@ const hbtn = (active: boolean): React.CSSProperties => ({
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function CounselorPage({ group }: { group: string }) {
-  const supabase = createClient();
+  const supabase = useMemo(() => createClient(), []);
   const today = new Date().toISOString().split("T")[0];
 
   // ── Async state
