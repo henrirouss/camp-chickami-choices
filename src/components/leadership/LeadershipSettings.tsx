@@ -272,13 +272,14 @@ export default function LeadershipSettings() {
       await supabase.from("sessions").update({ is_active: false }).neq("id", sessId);
 
       if (activitiesJson.length > 0) {
-        await supabase.from("activities").insert(
+        const { error: actInsertErr } = await supabase.from("activities").insert(
           activitiesJson.map(a => ({
             name: a.name, abbreviation: a.abbreviation,
             is_custom: true, is_active: true, session_id: sessId,
             open_p1: true, open_p2: true, open_p3: true,
           }))
         );
+        if (actInsertErr) throw new Error("Failed to insert session activities: " + actInsertErr.message);
       }
 
       await clearAllData();

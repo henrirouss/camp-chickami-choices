@@ -179,7 +179,7 @@ export default function CounselorPage({ group }: { group: string }) {
           absent: c.absent,
         })));
 
-        // 4. Load activities (filter by session if active)
+        // 4. Load activities — session activities when a session is active, otherwise permanent activities
         let actsQuery = supabase
           .from("activities")
           .select("id, name, abbreviation, open_p1, open_p2, open_p3, capacity_p1, capacity_p2, capacity_p3")
@@ -191,7 +191,23 @@ export default function CounselorPage({ group }: { group: string }) {
         }
         const { data: acts, error: actsErr } = await actsQuery;
         if (actsErr) throw new Error(actsErr.message ?? "Failed to load activities");
-        setActivities(acts ?? []);
+
+        // If a session is active but no rows exist in the activities table yet
+        // (e.g. insert failed due to missing RLS policy), fall back to the
+        // activity list stored in the session JSONB so counselors aren't blocked.
+        if (sess && (acts ?? []).length === 0 && sess.activities.length > 0) {
+          setActivities(sess.activities.map((a, i) => ({
+            id: `jb-${i}`,
+            name: a.name,
+            abbreviation: a.abbreviation,
+            open_p1: true, open_p2: true, open_p3: true,
+            capacity_p1: a.capacity_p1 ?? null,
+            capacity_p2: a.capacity_p2 ?? null,
+            capacity_p3: a.capacity_p3 ?? null,
+          })));
+        } else {
+          setActivities(acts ?? []);
+        }
 
         // 5. Load signup counts + schedule image in parallel
         await refreshCounts();
