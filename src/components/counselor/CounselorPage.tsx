@@ -137,6 +137,10 @@ export default function CounselorPage({ group }: { group: string }) {
 
   useEffect(() => {
     async function load() {
+      // DIAGNOSTIC — remove after confirming env vars reach the browser
+      console.log("[CounselorPage] NEXT_PUBLIC_SUPABASE_URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
+      console.log("[CounselorPage] NEXT_PUBLIC_SUPABASE_ANON_KEY defined:", !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, "length:", (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "").length);
+
       try {
         // 1. Load group by name
         const { data: grp, error: grpErr } = await supabase
@@ -144,7 +148,8 @@ export default function CounselorPage({ group }: { group: string }) {
           .select("id, name, counselor_name, submitted")
           .eq("name", group)
           .single();
-        if (grpErr || !grp) throw new Error(`Group "${group}" not found`);
+        if (grpErr) throw new Error(grpErr.message ?? `Group "${group}" not found`);
+        if (!grp) throw new Error(`Group "${group}" not found`);
         setGroupRow(grp);
 
         // If already submitted, jump straight to success
@@ -163,7 +168,7 @@ export default function CounselorPage({ group }: { group: string }) {
           .select("id, first_name, last_name, absent, choice_p1, choice_p2, choice_p3, choice_p4, choice_p5")
           .eq("group_id", grp.id)
           .order("last_name");
-        if (campErr) throw campErr;
+        if (campErr) throw new Error(campErr.message ?? "Failed to load campers");
         setCamperData((campers ?? []).map(c => ({
           id: c.id,
           displayName: `${c.first_name} ${c.last_name}`,
@@ -185,7 +190,7 @@ export default function CounselorPage({ group }: { group: string }) {
           actsQuery = actsQuery.is("session_id", null);
         }
         const { data: acts, error: actsErr } = await actsQuery;
-        if (actsErr) throw actsErr;
+        if (actsErr) throw new Error(actsErr.message ?? "Failed to load activities");
         setActivities(acts ?? []);
 
         // 5. Load signup counts + schedule image in parallel
